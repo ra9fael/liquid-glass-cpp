@@ -49,6 +49,7 @@ cbuffer Frame : register(b0) {
     float4 opticalControls;
     float4 cursorAndLighting;
     float4 morph;
+    float4 materialStyle;
 };
 struct VOut { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
 Texture2D backdrop : register(t0);
@@ -112,7 +113,10 @@ float4 PS(VOut input) : SV_TARGET {
     refractedUv += flow * refractBand * speed * 3.5 / desktopSize;
     float cursorDistance = length(p - cursor);
     float cursorLens = exp(-cursorDistance * cursorDistance / max(800.0, min(size.x,size.y) * min(size.x,size.y) * .10));
-    refractedUv += normal * cursorLens * edge * cursorGlow * 1.4 / desktopSize;
+    refractedUv += (p-cursor) * cursorLens * cursorGlow * (.12 + cursorAndLighting.w*.18) / desktopSize;
+    refractedUv += flow * speed * sin(time*8-length(p)*.035) * 7 / desktopSize;
+    float2 tile = frac(input.uv*size/max(materialStyle.y,8))-.5;
+    if(materialStyle.x>1.5) refractedUv += sin(tile*6.283185)*refraction*.12/desktopSize;
     float2 spectrum = displacement * dispersion * (p.x*p.y/max(size.x*size.y*.25,1.0));
     float3 red = sampleContent(refractedUv+spectrum);
     float3 orange = sampleContent(refractedUv+spectrum*(2.0/3.0));
@@ -139,6 +143,8 @@ float4 PS(VOut input) : SV_TARGET {
     color += rimColor * pow(facing, 14.0) * pow(rim,1.55) * .035;
     color += rimColor * cursorLens * edge * cursorGlow * .11;
     color += sin(dot(p, float2(.035,.052)) + time * 3.0) * edge * speed * .025;
+    if(materialStyle.x>1.5) color += pow(max(abs(tile.x),abs(tile.y))*2,16)*.09;
+    if(diagnostic<.5) color=lerp(color,materialStyle.z>.5?float3(.035,.045,.065):float3(.94,.96,.98),.22);
     float alpha = coverage;
     color = lerp(color, warmTint, (1.0-opacity)*.035);
     return float4(saturate(color) * alpha, alpha);
@@ -242,6 +248,13 @@ struct Window::Impl {
     bool forceDiagnosticPattern = false;
     bool captureVisible = true;
     float collapseProgress = 0;
+    float pressResponse = 0;
+    bool pressed = false;
+    ID3D11Query* timingDisjoint=nullptr;
+    ID3D11Query* timingStart=nullptr;
+    ID3D11Query* timingEnd=nullptr;
+    bool timingPending=false;
+    ULONGLONG pointerOutsideSince = 0;
     ULONGLONG lastDrawTick = 0;
 
     bool initDevice();
@@ -304,7 +317,7 @@ bool Window::Impl::initDevice()
     if (!shaders)
         return false;
     D3D11_BUFFER_DESC buffer{};
-    buffer.ByteWidth = 112;
+    buffer.ByteWidth = 128;
     buffer.Usage = D3D11_USAGE_DYNAMIC;
     buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     buffer.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -375,7 +388,7 @@ void Window::Impl::runBlur()
         ID3D11ShaderResourceView* nullView=nullptr;context->PSSetShaderResources(0,1,&nullView);
     };
     pass(blurPingTarget, backdropView, downsampleShader, 0, 0);
-    const float sigma=std::max(.5f,model.blur*.08f*model.scale);
+    const float sigma=std::max(.5f,(model.style==1?100:model.blur)*.08f*model.scale);
     pass(blurPongTarget, blurPingView, kawaseShader, sigma, 0.0f);
     pass(blurPingTarget, blurPongView, kawaseShader, 0.0f, sigma);
     blurDirty=false;
@@ -607,15 +620,16 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     POINT screenCursor{}; GetCursorPos(&screenCursor);
     const float localCursorX = static_cast<float>(screenCursor.x - desktop.left - width * .5f);
     const float localCursorY = static_cast<float>(screenCursor.y - desktop.top - height * .5f);
-    struct Frame { float v[28]; } frame{{
+    struct Frame { float v[32]; } frame{{
         static_cast<float>(width), static_cast<float>(height), static_cast<float>(model.radius), model.glass / 100.0f,
-        static_cast<float>(model.blur), static_cast<float>(model.refraction), static_cast<float>(now % 100000) / 1000.0f, 1.0f,
+        static_cast<float>(model.style==1?100:model.blur), static_cast<float>(model.style==1?model.refraction*.15f:model.refraction), static_cast<float>(now % 100000) / 1000.0f, model.animations?1.0f:0.0f,
         desktopW, desktopH, static_cast<float>(desktop.left - outputDesc.DesktopCoordinates.left - backdropLeft),
         static_cast<float>(desktop.top - outputDesc.DesktopCoordinates.top - backdropTop),
         velocityX + edgeVelocityX, velocityY + edgeVelocityY, edgePulse, (fixedBackdrop || model.debugPattern || forceDiagnosticPattern) ? 1.0f : 0.0f,
         model.dispersion / 100.0f, model.rimLight / 100.0f, model.surfaceMotion / 100.0f, 0,
-        localCursorX, localCursorY, model.animations ? model.surfaceMotion / 100.0f : 0, 0,
-        collapseProgress, static_cast<float>(edgeSide), 26.f*model.scale, 0}};
+        localCursorX, localCursorY, model.animations ? model.surfaceMotion / 100.0f : 0, pressResponse,
+        collapseProgress, static_cast<float>(edgeSide), 26.f*model.scale, 0,
+        static_cast<float>(model.style), model.tileSize*model.scale, model.dark?1.f:0.f, 0}};
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (SUCCEEDED(context->Map(frameBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         std::memcpy(mapped.pData, &frame, sizeof(frame));
@@ -638,12 +652,37 @@ void Window::Impl::draw()
     if (rc.right < 1 || rc.bottom < 1)
         return;
     const auto tick=GetTickCount64();
+    LARGE_INTEGER started{},captured{},finished{},frequency{};
+    const bool measure=static_cast<bool>(owner->frameMeasured);
+    double gpuMs=-1;
+    bool queryStarted=false;
+    if(measure) {
+        QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&started);
+        if(!timingDisjoint) {
+            D3D11_QUERY_DESC desc{D3D11_QUERY_TIMESTAMP_DISJOINT,0}; device->CreateQuery(&desc,&timingDisjoint);
+            desc.Query=D3D11_QUERY_TIMESTAMP; device->CreateQuery(&desc,&timingStart); device->CreateQuery(&desc,&timingEnd);
+        }
+        if(timingPending) {
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{}; UINT64 begin=0,end=0;
+            if(context->GetData(timingDisjoint,&disjoint,sizeof(disjoint),D3D11_ASYNC_GETDATA_DONOTFLUSH)==S_OK &&
+               context->GetData(timingStart,&begin,sizeof(begin),D3D11_ASYNC_GETDATA_DONOTFLUSH)==S_OK &&
+               context->GetData(timingEnd,&end,sizeof(end),D3D11_ASYNC_GETDATA_DONOTFLUSH)==S_OK) {
+                if(!disjoint.Disjoint) gpuMs=1000.0*(end-begin)/disjoint.Frequency;
+                timingPending=false;
+            }
+        }
+    }
     const float dt=lastDrawTick ? std::min(64.f,static_cast<float>(tick-lastDrawTick)) : 16.f;
     lastDrawTick=tick;
+    pressResponse += ((pressed?1.f:0.f)-pressResponse)*(1-std::exp(-dt/90.f));
     const float goal=collapsed?1.f:0.f;
     collapseProgress += (goal-collapseProgress)*(model.animations ? 1-std::exp(-dt/65.f) : 1.f);
     if(std::abs(goal-collapseProgress)<.001f) collapseProgress=goal;
     captureBackdrop();
+    if(measure) QueryPerformanceCounter(&captured);
+    if(measure && !timingPending && timingDisjoint && timingStart && timingEnd) {
+        context->Begin(timingDisjoint); context->End(timingStart); queryStarted=true;
+    }
     runBlur();
     RECT desktop{}; GetWindowRect(hwnd, &desktop);
     drawGlass(target, static_cast<UINT>(rc.right), static_cast<UINT>(rc.bottom), desktop);
@@ -663,7 +702,13 @@ void Window::Impl::draw()
         error = d2d->EndDraw();
         if (FAILED(error)) return;
     }
+    if(queryStarted) {context->End(timingEnd);context->End(timingDisjoint);timingPending=true;}
     error = swapChain->Present(1, 0);
+    if(measure) {
+        QueryPerformanceCounter(&finished);
+        owner->frameMeasured(1000.0*(finished.QuadPart-started.QuadPart)/frequency.QuadPart,
+            1000.0*(captured.QuadPart-started.QuadPart)/frequency.QuadPart,gpuMs);
+    }
 }
 
 LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -694,6 +739,7 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
         }
         return HTCLIENT;
     case WM_LBUTTONDOWN:
+        impl->pressed=true;
         if (!impl->locked) { impl->dragging = true; GetCursorPos(&impl->grab); impl->lastPointer=impl->grab; impl->lastMotionTick=GetTickCount64(); RECT r{}; GetWindowRect(hwnd, &r); impl->origin={r.left,r.top}; SetCapture(hwnd); }
         return 0;
     case WM_MOUSEMOVE:
@@ -723,6 +769,7 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
         }
         return DefWindowProcW(hwnd, message, wParam, lParam);
     case WM_LBUTTONUP:
+        impl->pressed=false;
         if (impl->dragging) {
             impl->dragging=false; ReleaseCapture();
             RECT r{}; GetWindowRect(hwnd,&r);
@@ -734,6 +781,9 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
         }
         return 0;
     case WM_RBUTTONUP:
+        return 0;
+    case WM_CAPTURECHANGED:
+        impl->pressed=false;impl->dragging=false;
         return 0;
     case WM_MOUSELEAVE:
         impl->trackingMouse = false;
@@ -747,15 +797,18 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
                 const float radius=26.f*impl->model.scale;
                 const float cx=impl->edgeSide==Edge::Left?r.left:impl->edgeSide==Edge::Right?r.right:(r.left+r.right)*.5f;
                 const float cy=impl->edgeSide==Edge::Top?r.top:impl->edgeSide==Edge::Bottom?r.bottom:(r.top+r.bottom)*.5f;
-                if(impl->collapsed && (cursor.x-cx)*(cursor.x-cx)+(cursor.y-cy)*(cursor.y-cy)<=radius*radius)
+                if(impl->collapsed && (cursor.x-cx)*(cursor.x-cx)+(cursor.y-cy)*(cursor.y-cy)<=radius*radius) {
+                    impl->pointerOutsideSince=0;
+                    KillTimer(hwnd,41);
                     impl->owner->edgeCollapsedChanged(false);
-                else if(!impl->collapsed && !PtInRect(&r,cursor)) {
-                    if(!impl->trackingMouse) {SetTimer(hwnd,41,700,nullptr);impl->trackingMouse=true;}
-                } else if(!impl->collapsed) {KillTimer(hwnd,41);impl->trackingMouse=false;}
+                } else if(!impl->collapsed && !PtInRect(&r,cursor)) {
+                    if(!impl->pointerOutsideSince) impl->pointerOutsideSince=GetTickCount64();
+                    if(GetTickCount64()-impl->pointerOutsideSince>=700) impl->owner->edgeCollapsedChanged(true);
+                } else {KillTimer(hwnd,41);impl->pointerOutsideSince=0;}
             }
             impl->draw();
         }
-        if (wParam == 41 && impl->model.edgeHide && !impl->dragging && impl->owner->edgeCollapsedChanged)
+        if (wParam == 41 && !impl->clickThrough && impl->model.edgeHide && !impl->dragging && impl->owner->edgeCollapsedChanged)
             impl->owner->edgeCollapsedChanged(true);
         if (wParam == 41) KillTimer(hwnd, 41);
         if (wParam == 43 && impl->compositionVisual) {
@@ -874,6 +927,7 @@ bool Window::create()
 void Window::destroy()
 {
     if (!m) return;
+    release(m->timingDisjoint);release(m->timingStart);release(m->timingEnd);m->timingPending=false;
     if (m->hwnd) DestroyWindow(m->hwnd);
     m->hwnd=nullptr; m->releaseTarget(); release(m->frameBuffer); release(m->blurBuffer); release(m->pixelShader); release(m->downsampleShader); release(m->kawaseShader); release(m->vertexShader); release(m->swapChain);
     release(m->edgeClip); release(m->compositionVisual); release(m->compositionTarget); release(m->compositionDevice);
@@ -894,7 +948,7 @@ void Window::setCaptureVisible(bool enabled){
 }
 void Window::setLocked(bool enabled){m->locked=enabled;}
 void Window::setMaterial(Material model){
-    const bool materialChanged=m->model.blur!=model.blur||m->model.glass!=model.glass||m->model.refraction!=model.refraction||m->model.radius!=model.radius||m->model.dark!=model.dark;
+    const bool materialChanged=m->model.style!=model.style||m->model.blur!=model.blur||m->model.glass!=model.glass||m->model.refraction!=model.refraction||m->model.radius!=model.radius||m->model.dark!=model.dark;
     m->model=std::move(model);if(materialChanged){m->backdropDirty=true;m->blurDirty=true;}render();
 }
 void Window::setEdgeCollapsed(bool collapsed,Edge side){

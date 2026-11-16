@@ -162,12 +162,17 @@ int main(){
         window.hide();
         desktopTest();
         material.edgeHide=true; window.setMaterial(material);window.setClickThrough(true);
-        window.edgeCollapsedChanged=[&](bool collapsed){window.setEdgeCollapsed(collapsed,liquid_glass::Edge::Left);};
-        window.show({80,80,240,160});window.setEdgeCollapsed(true,liquid_glass::Edge::Left);
-        POINT original{};GetCursorPos(&original);SetCursorPos(82,160);settle(window);
+        POINT original{};GetCursorPos(&original);
+        for(auto edge:{liquid_glass::Edge::Left,liquid_glass::Edge::Right,liquid_glass::Edge::Top,liquid_glass::Edge::Bottom}) {
+        window.edgeCollapsedChanged=[&,edge](bool collapsed){window.setEdgeCollapsed(collapsed,edge);};
+        std::cout<<"click-through edge="<<static_cast<int>(edge)<<std::endl;
+        window.show({80,80,240,160});window.setEdgeCollapsed(true,edge);
+        SetCursorPos(edge==liquid_glass::Edge::Left?82:edge==liquid_glass::Edge::Right?318:200,
+            edge==liquid_glass::Edge::Top?82:edge==liquid_glass::Edge::Bottom?238:160);settle(window);
         require(!window.edgeCollapsed(),"click-through hover expands half circle");
         SetCursorPos(500,500);settle(window);settle(window);settle(window);settle(window);
         require(window.edgeCollapsed(),"click-through pointer exit collapses panel");
+        }
         SetCursorPos(original.x,original.y);
         std::cout<<"liquid_glass_render: all checks passed\n";
         return 0;

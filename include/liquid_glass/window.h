@@ -25,6 +25,8 @@ struct Image {
 };
 
 struct Material {
+    int style = 0; // 0: liquid, 1: frosted, 2: square embossed
+    float tileSize = 24;
     bool dark = true;
     bool edgeHide = false;
     bool debugPattern = false;
@@ -75,6 +77,8 @@ public:
     std::function<void(bool)> edgeCollapsedChanged;
     // Called inside BeginDraw/EndDraw; the caller must not retain the context.
     std::function<void(const ContentFrame&)> paintContent;
+    // Optional diagnostics. GPU time is negative until a query completes.
+    std::function<void(double frameMs, double captureMs, double gpuMs)> frameMeasured;
 private:
     struct Impl;
     std::unique_ptr<Impl> m;
