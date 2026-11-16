@@ -35,6 +35,9 @@ void desktopTest() {
         if(brush){f.context->FillRectangle(D2D1::RectF(60,40,180,120),brush);brush->Release();}
     };
     auto fill=[&](int gray){
+        SetWindowPos(background,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        const auto bounds=window.geometry();
+        window.show(bounds);
         SetWindowLongPtrW(background,GWLP_USERDATA,gray);InvalidateRect(background,nullptr,FALSE);UpdateWindow(background);
     };
     for(bool visible:{false,true}) {
@@ -42,11 +45,18 @@ void desktopTest() {
         window.show({700,400,240,160});
         for(int gray:{220,40,220}) {
             fill(gray);settle(window);
-            require(gray>100?luminance>.7f:luminance<.3f,"stationary desktop luminance follows background");
+            HDC diagnostic=GetDC(nullptr);
+            const auto desktop=GetPixel(diagnostic,650,350);
+            ReleaseDC(nullptr,diagnostic);
+            std::cout<<"background desktop RGB="<<static_cast<int>(GetRValue(desktop))<<","<<static_cast<int>(GetGValue(desktop))<<","<<static_cast<int>(GetBValue(desktop))<<'\n';
+            require(desktop!=CLR_INVALID&&std::abs(static_cast<int>(GetRValue(desktop))-gray)<8
+                &&std::abs(static_cast<int>(GetGValue(desktop))-gray)<8&&std::abs(static_cast<int>(GetBValue(desktop))-gray)<8,
+                "test backdrop must be visible on the interactive desktop");
             const auto image=window.backdropSnapshot();
             require(!image.empty(),"desktop capture exists");
             const int x=image.width/2,y=image.height/2;
             std::cout<<"captureVisible="<<visible<<" background="<<gray<<" RGB="<<channel(image,x,y,2)<<","<<channel(image,x,y,1)<<","<<channel(image,x,y,0)<<" luma="<<luminance<<'\n';
+            require(gray>100?luminance>.7f:luminance<.3f,"stationary desktop luminance follows background");
             require(std::abs(channel(image,x,y,2)-gray)<8,"capture excludes own content");
             require(std::abs(channel(image,x,y,1)-gray)<8,"capture retains underlying background");
             HDC screen=GetDC(nullptr);
@@ -55,6 +65,27 @@ void desktopTest() {
                 require(std::abs(static_cast<int>(GetRValue(pixel))-gray)<8,"desktop corners reveal background");
             }
             ReleaseDC(nullptr,screen);
+        }
+        for(int width : {360,300,240}) {
+            const int height=width*2/3;
+            window.setGeometry({700,400,width,height});
+            fill(110);settle(window);
+            std::cout<<"desktop resize="<<width<<" luma="<<luminance<<'\n';
+            require(luminance>.35f&&luminance<.5f,"desktop resize captures new background");
+            require(SUCCEEDED(window.lastError()),"desktop resize HRESULT");
+            const auto resized=window.snapshot();
+            require(resized.width==width&&resized.height==height,"desktop resize dimensions");
+            HDC screen=GetDC(nullptr);
+            bool corners=true;
+            for(POINT p : {POINT{700,400},POINT{700+width-1,400},POINT{700,400+height-1},POINT{700+width-1,400+height-1}}) {
+                const COLORREF pixel=GetPixel(screen,p.x,p.y);
+                corners &= pixel!=CLR_INVALID && std::abs(static_cast<int>(GetRValue(pixel))-110)<8
+                    && std::abs(static_cast<int>(GetGValue(pixel))-110)<8 && std::abs(static_cast<int>(GetBValue(pixel))-110)<8;
+            }
+            const COLORREF content=GetPixel(screen,800,480);
+            ReleaseDC(nullptr,screen);
+            require(corners,"resized desktop corners reveal background");
+            require(GetRValue(content)>230&&GetGValue(content)<20,"resized desktop content remains visible");
         }
     }
     window.hide();DestroyWindow(background);
