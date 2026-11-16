@@ -53,6 +53,13 @@ struct VOut { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
 Texture2D backdrop : register(t0);
 Texture2D softenedBackdrop : register(t1);
 SamplerState linearClamp : register(s0);
+float3 sampleContent(float2 uv) {
+    float2 halfTexel = .5 / desktopSizeOrigin.xy;
+    uv = clamp(uv, halfTexel, 1.0-halfTexel);
+    return lerp(backdrop.Sample(linearClamp,uv).rgb,
+                softenedBackdrop.Sample(linearClamp,uv).rgb,
+                saturate(blurRefractionTimeMotion.x/100.0));
+}
 float sdRoundRect(float2 p, float2 b, float r) {
     float2 q = abs(p) - b + r;
     return min(max(q.x,q.y),0.0) + length(max(q,0.0)) - r;
@@ -83,7 +90,6 @@ float4 PS(VOut input) : SV_TARGET {
     float cursorGlow = cursorAndLighting.z;
     float2 p = input.uv * size - size * .5;
     float corner = min(radius, min(size.x,size.y) * .42);
-    float power = lerp(2.0, 3.4, saturate(corner / max(1.0, min(size.x,size.y) * .42)));
     float d = sdRoundRect(p, size * .5 - 1.0, corner);
     float coverage = 1.0 - smoothstep(-max(fwidth(d), .75), max(fwidth(d), .75), d);
     float edge = 1.0 - smoothstep(0.0, max(3.0, corner), -d);
@@ -95,20 +101,23 @@ float4 PS(VOut input) : SV_TARGET {
     float thickness = 1.0 + leading * speed * .32;
     float2 rawUv = diagnostic > .5 ? input.uv : (desktopOrigin + input.uv * size) / desktopSize;
     float refractBand = 1.0 - sqrt(max(0.0, 1.0 - edge * edge));
-    float2 refractedUv = rawUv + (normal * thickness + flow * .12) * refractBand * refraction * .28 / desktopSize;
+    float2 displacement = normal * thickness * refractBand * refraction * .28 / desktopSize;
+    float2 refractedUv = rawUv + displacement;
     refractedUv += flow * refractBand * speed * 3.5 / desktopSize;
     float cursorDistance = length(p - cursor);
     float cursorLens = exp(-cursorDistance * cursorDistance / max(800.0, min(size.x,size.y) * min(size.x,size.y) * .10));
     refractedUv += normal * cursorLens * edge * cursorGlow * 1.4 / desktopSize;
-    float3 raw = backdrop.Sample(linearClamp, saturate(refractedUv)).rgb;
-    float3 softened = softenedBackdrop.Sample(linearClamp, saturate(refractedUv)).rgb;
-    float blurMix = saturate(blur / 100.0);
-    float3 base = lerp(raw, softened, blurMix);
-    float spectrum = pow(edge, 2.35) * saturate(refraction / 100.0) * dispersion * .32 / desktopSize.x;
-    base.r = lerp(backdrop.Sample(linearClamp, saturate(refractedUv + normal * spectrum)).r,
-                  softenedBackdrop.Sample(linearClamp, saturate(refractedUv + normal * spectrum)).r, blurMix);
-    base.b = lerp(backdrop.Sample(linearClamp, saturate(refractedUv - normal * spectrum)).b,
-                  softenedBackdrop.Sample(linearClamp, saturate(refractedUv - normal * spectrum)).b, blurMix);
+    float2 spectrum = displacement * dispersion * (p.x*p.y/max(size.x*size.y*.25,1.0));
+    float3 red = sampleContent(refractedUv+spectrum);
+    float3 orange = sampleContent(refractedUv+spectrum*(2.0/3.0));
+    float3 yellow = sampleContent(refractedUv+spectrum/3.0);
+    float3 green = sampleContent(refractedUv);
+    float3 cyan = sampleContent(refractedUv-spectrum/3.0);
+    float3 blue = sampleContent(refractedUv-spectrum*(2.0/3.0));
+    float3 purple = sampleContent(refractedUv-spectrum);
+    float3 base = float3((red.r+orange.r+yellow.r)/3.5+purple.r/7.0,
+        orange.g/7.0+(yellow.g+green.g+cyan.g)/3.5,
+        (cyan.b+blue.b+purple.b)/3.0);
     float luma = dot(base, float3(.2126,.7152,.0722));
     float3 coolTint = float3(.20,.58,.82);
     float3 warmTint = float3(.82,.93,1.0);
@@ -143,13 +152,18 @@ float4 Downsample(VOut input) : SV_TARGET {
             sourceTexture.Sample(linearClamp, input.uv + float2( d.x, d.y))) * .25;
 }
 float4 Kawase(VOut input) : SV_TARGET {
-    float2 d = texel * direction;
-    float4 c = sourceTexture.Sample(linearClamp, input.uv) * .25;
-    c += sourceTexture.Sample(linearClamp, input.uv + float2( d.x, d.y)) * .1875;
-    c += sourceTexture.Sample(linearClamp, input.uv + float2(-d.x, d.y)) * .1875;
-    c += sourceTexture.Sample(linearClamp, input.uv + float2( d.x,-d.y)) * .1875;
-    c += sourceTexture.Sample(linearClamp, input.uv + float2(-d.x,-d.y)) * .1875;
-    return c;
+    float sigma=max(length(direction),.5);
+    float2 axis=direction/sigma;
+    float4 c=sourceTexture.Sample(linearClamp,input.uv);
+    float total=1;
+    int support=min(24,(int)ceil(sigma*3));
+    for(int i=1;i<=support;++i) {
+        float weight=exp(-.5*i*i/(sigma*sigma));
+        float2 offset=axis*texel*i;
+        c+=(sourceTexture.Sample(linearClamp,input.uv+offset)+sourceTexture.Sample(linearClamp,input.uv-offset))*weight;
+        total+=2*weight;
+    }
+    return c/total;
 }
 )";
 
@@ -307,7 +321,7 @@ void Window::Impl::releaseTarget()
 
 void Window::Impl::ensureBlurTargets(UINT width, UINT height, DXGI_FORMAT format)
 {
-    width = std::max(1u, width / 4); height = std::max(1u, height / 4);
+    width = std::max(1u, width / 2); height = std::max(1u, height / 2);
     if (blurPing && blurWidth == width && blurHeight == height)
         return;
     release(blurPingView); release(blurPongView); release(blurPingTarget); release(blurPongTarget); release(blurPing); release(blurPong);
@@ -352,8 +366,9 @@ void Window::Impl::runBlur()
         ID3D11ShaderResourceView* nullView=nullptr;context->PSSetShaderResources(0,1,&nullView);
     };
     pass(blurPingTarget, backdropView, downsampleShader, 0, 0);
-    pass(blurPongTarget, blurPingView, kawaseShader, 2.0f, 2.0f);
-    pass(blurPingTarget, blurPongView, kawaseShader, 4.0f, 4.0f);
+    const float sigma=std::max(.5f,model.blur*.08f*model.scale);
+    pass(blurPongTarget, blurPingView, kawaseShader, sigma, 0.0f);
+    pass(blurPingTarget, blurPongView, kawaseShader, 0.0f, sigma);
     blurDirty=false;
 }
 

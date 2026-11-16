@@ -37,6 +37,19 @@ int main(){
                 require(channel(result,p.x,p.y,3)==0,"rounded corners must have zero alpha");
             require(std::abs(channel(result,size/2,height/4,0)-64)<8,"center sample position must stay aligned");
         }
+        for(int y=0;y<160;++y)for(int x=0;x<240;++x){
+            const auto i=(y*240+x)*4;
+            const unsigned char v=((x/4+y/4)%2)?200:40;
+            input.pixels[i]=input.pixels[i+1]=input.pixels[i+2]=v;
+        }
+        window.setBackdrop(input); material.blur=100; window.setMaterial(material);
+        window.render(); window.render();
+        const auto blurred=window.snapshot();
+        for(int y=55;y<105;y+=7)for(int x=75;x<165;x+=7){
+            const int b=channel(blurred,x,y,0),g=channel(blurred,x,y,1),r=channel(blurred,x,y,2);
+            require(std::abs(b-g)<4&&std::abs(r-g)<4,"neutral blur must treat RGB consistently");
+            require(g>80&&g<160,"blur must reduce checker contrast");
+        }
         window.hide();
         std::cout<<"liquid_glass_render: all checks passed\n";
         return 0;
