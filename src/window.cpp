@@ -144,9 +144,8 @@ float4 PS(VOut input) : SV_TARGET {
     color += rimColor * cursorLens * edge * cursorGlow * .11;
     color += sin(dot(p, float2(.035,.052)) + time * 3.0) * edge * speed * .025;
     if(materialStyle.x>1.5) color += pow(max(abs(tile.x),abs(tile.y))*2,16)*.09;
-    if(diagnostic<.5) color=lerp(color,materialStyle.z>.5?float3(.035,.045,.065):float3(.94,.96,.98),.22);
+    if(diagnostic<.5) color=lerp(color,materialStyle.z>.5?float3(.035,.045,.065):float3(.94,.96,.98),lerp(.85,.04,saturate(opacity)));
     float alpha = coverage;
-    color = lerp(color, warmTint, (1.0-opacity)*.035);
     return float4(saturate(color) * alpha, alpha);
 }
 )";
