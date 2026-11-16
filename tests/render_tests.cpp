@@ -161,6 +161,14 @@ int main(){
         }
         window.hide();
         desktopTest();
+        material.edgeHide=true; window.setMaterial(material);window.setClickThrough(true);
+        window.edgeCollapsedChanged=[&](bool collapsed){window.setEdgeCollapsed(collapsed,liquid_glass::Edge::Left);};
+        window.show({80,80,240,160});window.setEdgeCollapsed(true,liquid_glass::Edge::Left);
+        POINT original{};GetCursorPos(&original);SetCursorPos(82,160);settle(window);
+        require(!window.edgeCollapsed(),"click-through hover expands half circle");
+        SetCursorPos(500,500);settle(window);settle(window);settle(window);settle(window);
+        require(window.edgeCollapsed(),"click-through pointer exit collapses panel");
+        SetCursorPos(original.x,original.y);
         std::cout<<"liquid_glass_render: all checks passed\n";
         return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

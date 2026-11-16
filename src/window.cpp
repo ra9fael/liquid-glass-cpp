@@ -741,7 +741,20 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
             SetTimer(hwnd, 41, 700, nullptr);
         return 0;
     case WM_TIMER:
-        if(wParam==44 && IsWindowVisible(hwnd)) impl->draw();
+        if(wParam==44 && IsWindowVisible(hwnd)) {
+            if(impl->clickThrough && impl->model.edgeHide && impl->owner->edgeCollapsedChanged) {
+                POINT cursor{};GetCursorPos(&cursor);RECT r{};GetWindowRect(hwnd,&r);
+                const float radius=26.f*impl->model.scale;
+                const float cx=impl->edgeSide==Edge::Left?r.left:impl->edgeSide==Edge::Right?r.right:(r.left+r.right)*.5f;
+                const float cy=impl->edgeSide==Edge::Top?r.top:impl->edgeSide==Edge::Bottom?r.bottom:(r.top+r.bottom)*.5f;
+                if(impl->collapsed && (cursor.x-cx)*(cursor.x-cx)+(cursor.y-cy)*(cursor.y-cy)<=radius*radius)
+                    impl->owner->edgeCollapsedChanged(false);
+                else if(!impl->collapsed && !PtInRect(&r,cursor)) {
+                    if(!impl->trackingMouse) {SetTimer(hwnd,41,700,nullptr);impl->trackingMouse=true;}
+                } else if(!impl->collapsed) {KillTimer(hwnd,41);impl->trackingMouse=false;}
+            }
+            impl->draw();
+        }
         if (wParam == 41 && impl->model.edgeHide && !impl->dragging && impl->owner->edgeCollapsedChanged)
             impl->owner->edgeCollapsedChanged(true);
         if (wParam == 41) KillTimer(hwnd, 41);
