@@ -438,7 +438,7 @@ void Window::Impl::captureBackdrop()
     if (fixedBackdrop) return;
     if (model.debugPattern || forceDiagnosticPattern) { createDiagnosticBackdrop(); return; }
     const ULONGLONG captureNow = GetTickCount64();
-    const bool needsFrame = backdropDirty || (dragging && captureNow - lastBackdropCapture >= 80);
+    const bool needsFrame = backdropDirty || captureNow - lastBackdropCapture >= 80;
     if (!needsFrame)
         return;
     ensureDuplication();
@@ -493,6 +493,7 @@ void Window::Impl::captureBackdrop()
             backdropIsDiagnostic = false;
             const UINT sx=cropWidth/2, sy=cropHeight/2;
             D3D11_TEXTURE2D_DESC staging=desc;
+            backdrop->GetDesc(&staging);
             staging.Usage=D3D11_USAGE_STAGING; staging.BindFlags=0; staging.CPUAccessFlags=D3D11_CPU_ACCESS_READ; staging.MiscFlags=0;
             ID3D11Texture2D* readback=nullptr;
             if(SUCCEEDED(device->CreateTexture2D(&staging,nullptr,&readback))){

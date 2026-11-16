@@ -2,6 +2,63 @@
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <d2d1_3.h>
+void require(bool value,const char* message);
+int channel(const liquid_glass::Image& image,int x,int y,int c);
+LRESULT CALLBACK backgroundProc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
+    if(message==WM_PAINT){PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);RECT r{};GetClientRect(hwnd,&r);
+        int gray=static_cast<int>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
+        HBRUSH brush=CreateSolidBrush(RGB(gray,gray,gray));FillRect(dc,&r,brush);DeleteObject(brush);EndPaint(hwnd,&ps);return 0;}
+    return DefWindowProcW(hwnd,message,w,l);
+}
+
+void settle(liquid_glass::Window& window) {
+    const auto end=GetTickCount64()+350;
+    while(GetTickCount64()<end) {
+        MSG msg{};
+        while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}
+        window.render();
+        Sleep(20);
+    }
+}
+
+void desktopTest() {
+    WNDCLASSW cls{};cls.lpfnWndProc=backgroundProc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"GlassTestBackdrop";RegisterClassW(&cls);
+    HWND background=CreateWindowExW(WS_EX_TOPMOST,cls.lpszClassName,L"",WS_POPUP|WS_VISIBLE,600,300,600,400,nullptr,nullptr,cls.hInstance,nullptr);
+    require(background!=nullptr,"desktop background window");
+    liquid_glass::Window window;
+    float luminance=0;
+    window.paintContent=[&](const liquid_glass::ContentFrame& f){
+        luminance=f.backdropLuminance;
+        ID2D1SolidColorBrush* brush=nullptr;
+        f.context->CreateSolidColorBrush(D2D1::ColorF(1,0,0,1),&brush);
+        if(brush){f.context->FillRectangle(D2D1::RectF(60,40,180,120),brush);brush->Release();}
+    };
+    auto fill=[&](int gray){
+        SetWindowLongPtrW(background,GWLP_USERDATA,gray);InvalidateRect(background,nullptr,FALSE);UpdateWindow(background);
+    };
+    for(bool visible:{false,true}) {
+        window.setCaptureVisible(visible);
+        window.show({700,400,240,160});
+        for(int gray:{220,40,220}) {
+            fill(gray);settle(window);
+            require(gray>100?luminance>.7f:luminance<.3f,"stationary desktop luminance follows background");
+            const auto image=window.backdropSnapshot();
+            require(!image.empty(),"desktop capture exists");
+            const int x=image.width/2,y=image.height/2;
+            std::cout<<"captureVisible="<<visible<<" background="<<gray<<" RGB="<<channel(image,x,y,2)<<","<<channel(image,x,y,1)<<","<<channel(image,x,y,0)<<" luma="<<luminance<<'\n';
+            require(std::abs(channel(image,x,y,2)-gray)<8,"capture excludes own content");
+            require(std::abs(channel(image,x,y,1)-gray)<8,"capture retains underlying background");
+            HDC screen=GetDC(nullptr);
+            for(POINT p : {POINT{700,400},POINT{939,400},POINT{700,559},POINT{939,559}}){
+                COLORREF pixel=GetPixel(screen,p.x,p.y);
+                require(std::abs(static_cast<int>(GetRValue(pixel))-gray)<8,"desktop corners reveal background");
+            }
+            ReleaseDC(nullptr,screen);
+        }
+    }
+    window.hide();DestroyWindow(background);
+}
 
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 int channel(const liquid_glass::Image& image,int x,int y,int c){return image.pixels[(y*image.width+x)*4+c];}
@@ -51,6 +108,7 @@ int main(){
             require(g>80&&g<160,"blur must reduce checker contrast");
         }
         window.hide();
+        desktopTest();
         std::cout<<"liquid_glass_render: all checks passed\n";
         return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
