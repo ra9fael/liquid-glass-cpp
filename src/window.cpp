@@ -48,6 +48,7 @@ cbuffer Frame : register(b0) {
     float4 velocityAndShape;
     float4 opticalControls;
     float4 cursorAndLighting;
+    float4 morph;
 };
 struct VOut { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
 Texture2D backdrop : register(t0);
@@ -91,6 +92,11 @@ float4 PS(VOut input) : SV_TARGET {
     float2 p = input.uv * size - size * .5;
     float corner = min(radius, min(size.x,size.y) * .42);
     float d = sdRoundRect(p, size * .5 - 1.0, corner);
+    float2 anchor = morph.y < .5 ? float2(-size.x*.5,0) : morph.y < 1.5 ? float2(size.x*.5,0) : morph.y < 2.5 ? float2(0,-size.y*.5) : float2(0,size.y*.5);
+    float2 center = lerp(float2(0,0), anchor, morph.x);
+    float2 halfSize = lerp(size*.5-1, float2(morph.z,morph.z), morph.x);
+    corner = lerp(corner,morph.z,morph.x);
+    d = sdRoundRect(p-center,halfSize,corner);
     float coverage = 1.0 - smoothstep(-max(fwidth(d), .75), max(fwidth(d), .75), d);
     float edge = 1.0 - smoothstep(0.0, max(3.0, corner), -d);
     float rim = pow(edge, 2.25);
@@ -231,9 +237,12 @@ struct Window::Impl {
     float backdropLuma = 0.22f;
     bool backdropDirty = true;
     ULONGLONG lastBackdropCapture = 0;
+    ULONGLONG lastBackdropCopy = 0;
     bool backdropIsDiagnostic = false;
     bool forceDiagnosticPattern = false;
     bool captureVisible = true;
+    float collapseProgress = 0;
+    ULONGLONG lastDrawTick = 0;
 
     bool initDevice();
     void resize(UINT width, UINT height);
@@ -295,7 +304,7 @@ bool Window::Impl::initDevice()
     if (!shaders)
         return false;
     D3D11_BUFFER_DESC buffer{};
-    buffer.ByteWidth = 96;
+    buffer.ByteWidth = 112;
     buffer.Usage = D3D11_USAGE_DYNAMIC;
     buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     buffer.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -438,7 +447,7 @@ void Window::Impl::captureBackdrop()
     if (fixedBackdrop) return;
     if (model.debugPattern || forceDiagnosticPattern) { createDiagnosticBackdrop(); return; }
     const ULONGLONG captureNow = GetTickCount64();
-    const bool needsFrame = backdropDirty || captureNow - lastBackdropCapture >= 80;
+    const bool needsFrame = backdropDirty || captureNow - lastBackdropCapture >= 16;
     if (!needsFrame)
         return;
     ensureDuplication();
@@ -451,7 +460,7 @@ void Window::Impl::captureBackdrop()
     }
     DXGI_OUTDUPL_FRAME_INFO info{};
     IDXGIResource* resource = nullptr;
-    const HRESULT acquired = duplication->AcquireNextFrame(16, &info, &resource);
+    const HRESULT acquired = duplication->AcquireNextFrame(0, &info, &resource);
     if (acquired == DXGI_ERROR_WAIT_TIMEOUT) {
         if (restoreCaptureAffinity) SetWindowDisplayAffinity(hwnd, WDA_NONE);
         return;
@@ -474,6 +483,26 @@ void Window::Impl::captureBackdrop()
         const LONG sourceBottom = std::clamp<LONG>(window.bottom - outputDesc.DesktopCoordinates.top + kCapturePad, sourceTop + 1, outputHeight);
         const UINT cropWidth = static_cast<UINT>(sourceRight - sourceLeft);
         const UINT cropHeight = static_cast<UINT>(sourceBottom - sourceTop);
+        if (!backdropDirty && backdrop && !captureVisible && captureNow-lastBackdropCopy<250) {
+            bool changed=info.TotalMetadataBufferSize==0 && info.LastPresentTime.QuadPart!=0;
+            const RECT region{sourceLeft,sourceTop,sourceRight,sourceBottom};
+            RECT overlap{};
+            UINT bytes=0;
+            duplication->GetFrameDirtyRects(0,nullptr,&bytes);
+            std::vector<RECT> dirty(bytes/sizeof(RECT));
+            if(bytes && SUCCEEDED(duplication->GetFrameDirtyRects(bytes,dirty.data(),&bytes)))
+                for(const auto& rect:dirty) changed |= IntersectRect(&overlap,&region,&rect)!=FALSE;
+            else if(bytes) changed=true;
+            bytes=0;
+            duplication->GetFrameMoveRects(0,nullptr,&bytes);
+            std::vector<DXGI_OUTDUPL_MOVE_RECT> moves(bytes/sizeof(DXGI_OUTDUPL_MOVE_RECT));
+            if(bytes && SUCCEEDED(duplication->GetFrameMoveRects(bytes,moves.data(),&bytes)))
+                for(const auto& move:moves) changed |= IntersectRect(&overlap,&region,&move.DestinationRect)!=FALSE;
+            else if(bytes) changed=true;
+            if(!changed) {
+                release(frame);release(resource);duplication->ReleaseFrame();lastBackdropCapture=captureNow;return;
+            }
+        }
         D3D11_TEXTURE2D_DESC current{};
         if (backdrop) backdrop->GetDesc(&current);
         if (!backdrop || backdropIsDiagnostic || current.Width != cropWidth || current.Height != cropHeight || current.Format != desc.Format) {
@@ -494,12 +523,14 @@ void Window::Impl::captureBackdrop()
             const UINT sx=cropWidth/2, sy=cropHeight/2;
             D3D11_TEXTURE2D_DESC staging=desc;
             backdrop->GetDesc(&staging);
+            staging.Width=1; staging.Height=1;
             staging.Usage=D3D11_USAGE_STAGING; staging.BindFlags=0; staging.CPUAccessFlags=D3D11_CPU_ACCESS_READ; staging.MiscFlags=0;
             ID3D11Texture2D* readback=nullptr;
             if(SUCCEEDED(device->CreateTexture2D(&staging,nullptr,&readback))){
-                context->CopyResource(readback,backdrop);D3D11_MAPPED_SUBRESOURCE mapped{};
+                const D3D11_BOX center{sx,sy,0,sx+1,sy+1,1};
+                context->CopySubresourceRegion(readback,0,0,0,0,backdrop,0,&center);D3D11_MAPPED_SUBRESOURCE mapped{};
                 if(SUCCEEDED(context->Map(readback,0,D3D11_MAP_READ,0,&mapped))){
-                    const auto* px=static_cast<const unsigned char*>(mapped.pData)+static_cast<size_t>(sy)*mapped.RowPitch+sx*4;
+                    const auto* px=static_cast<const unsigned char*>(mapped.pData);
                     backdropLuma=(.0722f*px[0]+.7152f*px[1]+.2126f*px[2])/255.0f;
                     context->Unmap(readback,0);
                 }release(readback);
@@ -512,6 +543,7 @@ void Window::Impl::captureBackdrop()
     backdropDirty = false;
     blurDirty = true;
     lastBackdropCapture = captureNow;
+    lastBackdropCopy = captureNow;
 }
 
 void Window::Impl::resize(UINT width, UINT height)
@@ -575,14 +607,15 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     POINT screenCursor{}; GetCursorPos(&screenCursor);
     const float localCursorX = static_cast<float>(screenCursor.x - desktop.left - width * .5f);
     const float localCursorY = static_cast<float>(screenCursor.y - desktop.top - height * .5f);
-    struct Frame { float v[24]; } frame{{
+    struct Frame { float v[28]; } frame{{
         static_cast<float>(width), static_cast<float>(height), static_cast<float>(model.radius), model.glass / 100.0f,
         static_cast<float>(model.blur), static_cast<float>(model.refraction), static_cast<float>(now % 100000) / 1000.0f, 1.0f,
         desktopW, desktopH, static_cast<float>(desktop.left - outputDesc.DesktopCoordinates.left - backdropLeft),
         static_cast<float>(desktop.top - outputDesc.DesktopCoordinates.top - backdropTop),
         velocityX + edgeVelocityX, velocityY + edgeVelocityY, edgePulse, (fixedBackdrop || model.debugPattern || forceDiagnosticPattern) ? 1.0f : 0.0f,
         model.dispersion / 100.0f, model.rimLight / 100.0f, model.surfaceMotion / 100.0f, 0,
-        localCursorX, localCursorY, model.surfaceMotion / 100.0f, 0}};
+        localCursorX, localCursorY, model.animations ? model.surfaceMotion / 100.0f : 0, 0,
+        collapseProgress, static_cast<float>(edgeSide), 26.f*model.scale, 0}};
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (SUCCEEDED(context->Map(frameBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         std::memcpy(mapped.pData, &frame, sizeof(frame));
@@ -604,6 +637,12 @@ void Window::Impl::draw()
     RECT rc{}; GetClientRect(hwnd, &rc);
     if (rc.right < 1 || rc.bottom < 1)
         return;
+    const auto tick=GetTickCount64();
+    const float dt=lastDrawTick ? std::min(64.f,static_cast<float>(tick-lastDrawTick)) : 16.f;
+    lastDrawTick=tick;
+    const float goal=collapsed?1.f:0.f;
+    collapseProgress += (goal-collapseProgress)*(model.animations ? 1-std::exp(-dt/65.f) : 1.f);
+    if(std::abs(goal-collapseProgress)<.001f) collapseProgress=goal;
     captureBackdrop();
     runBlur();
     RECT desktop{}; GetWindowRect(hwnd, &desktop);
@@ -613,22 +652,13 @@ void Window::Impl::draw()
 
     if (d2d) {
         d2d->BeginDraw();
-        if (owner->paintContent) owner->paintContent({d2d,width,height,backdropLuma});
-        if (collapsed) {
-            ID2D1SolidColorBrush* triggerBrush=nullptr;
-            d2d->CreateSolidColorBrush(D2D1::ColorF(.68f,.90f,1.0f,.92f),&triggerBrush);
-            const float triggerWidth=10.0f;
-            // The visual is translated toward the edge. Keep the opposite source
-            // sliver so it lands inside the original HWND after translation.
-            if (edgeSide==Edge::Left)
-                d2d->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(width-triggerWidth,height*.5f-26,width,height*.5f+26),triggerWidth*.5f,triggerWidth*.5f),triggerBrush);
-            else if (edgeSide==Edge::Right)
-                d2d->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(0,height*.5f-26,triggerWidth,height*.5f+26),triggerWidth*.5f,triggerWidth*.5f),triggerBrush);
-            else if (edgeSide==Edge::Top)
-                d2d->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(width*.5f-26,height-triggerWidth,width*.5f+26,height),triggerWidth*.5f,triggerWidth*.5f),triggerBrush);
-            else
-                d2d->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(width*.5f-26,0,width*.5f+26,triggerWidth),triggerWidth*.5f,triggerWidth*.5f),triggerBrush);
-            release(triggerBrush);
+        const float contentOpacity=std::clamp(1.f-collapseProgress*5.f,0.f,1.f);
+        if (owner->paintContent && contentOpacity>0) {
+            const auto layer=D2D1::LayerParameters1(D2D1::InfiniteRect(),nullptr,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                D2D1::Matrix3x2F::Identity(),contentOpacity);
+            d2d->PushLayer(layer,nullptr);
+            owner->paintContent({d2d,width,height,backdropLuma});
+            d2d->PopLayer();
         }
         error = d2d->EndDraw();
         if (FAILED(error)) return;
@@ -656,7 +686,10 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
             const bool left = impl->edgeSide == Edge::Left;
             const bool top = impl->edgeSide == Edge::Top;
             const int x = point.x - rect.left, y = point.y - rect.top;
-            const bool strip = right ? x >= rect.right - rect.left - 8 : left ? x < 8 : top ? y < 8 : y >= rect.bottom - rect.top - 8;
+            const float radius=26.f*impl->model.scale;
+            const float dx=right?x-(rect.right-rect.left):left?x:x-(rect.right-rect.left)*.5f;
+            const float dy=top?y:(!right&&!left)?y-(rect.bottom-rect.top):y-(rect.bottom-rect.top)*.5f;
+            const bool strip = dx*dx+dy*dy<=radius*radius;
             return strip ? HTCLIENT : HTTRANSPARENT;
         }
         return HTCLIENT;
@@ -708,6 +741,7 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
             SetTimer(hwnd, 41, 700, nullptr);
         return 0;
     case WM_TIMER:
+        if(wParam==44 && IsWindowVisible(hwnd)) impl->draw();
         if (wParam == 41 && impl->model.edgeHide && !impl->dragging && impl->owner->edgeCollapsedChanged)
             impl->owner->edgeCollapsedChanged(true);
         if (wParam == 41) KillTimer(hwnd, 41);
@@ -761,12 +795,12 @@ Image Window::Impl::capsuleSnapshot() const
     if (!collapsed) return {};
     const Image panel = snapshot();
     if (panel.empty()) return {};
-    constexpr int width = 10;
-    constexpr int longSide = 52;
+    const int width = static_cast<int>(std::ceil(26*model.scale));
+    const int longSide = width*2;
     const bool vertical=edgeSide==Edge::Left||edgeSide==Edge::Right;
     Image result; result.width=std::min(panel.width,vertical?width:longSide); result.height=std::min(panel.height,vertical?longSide:width);
-    const int x=vertical?(edgeSide==Edge::Left?panel.width-result.width:0):(panel.width-result.width)/2;
-    const int y=vertical?(panel.height-result.height)/2:(edgeSide==Edge::Top?panel.height-result.height:0);
+    const int x=vertical?(edgeSide==Edge::Right?panel.width-result.width:0):(panel.width-result.width)/2;
+    const int y=vertical?(panel.height-result.height)/2:(edgeSide==Edge::Bottom?panel.height-result.height:0);
     result.pixels.resize(result.width*result.height*4);
     for(int row=0;row<result.height;++row) std::memcpy(result.pixels.data()+row*result.width*4,panel.pixels.data()+((y+row)*panel.width+x)*4,result.width*4);
     return result;
@@ -820,6 +854,7 @@ bool Window::create()
     if (SUCCEEDED(created)) created = m->compositionDevice->Commit();
     release(factory); release(adapter); release(dxgi);
     if (FAILED(created)) return false;
+    SetTimer(m->hwnd,44,16,nullptr);
     return true;
 }
 
@@ -851,46 +886,6 @@ void Window::setMaterial(Material model){
 }
 void Window::setEdgeCollapsed(bool collapsed,Edge side){
     m->collapsed=collapsed;m->edgeSide=side;
-    if (m->compositionVisual && m->hwnd) {
-        RECT r{}; GetClientRect(m->hwnd, &r);
-        const float slideReveal = 8.0f;
-        float x=0,y=0;
-        if (collapsed) {
-            if (side == Edge::Left) { x = -static_cast<float>(r.right-r.left) + slideReveal; m->edgeVelocityX=-850; }
-            else if (side == Edge::Right) { x = static_cast<float>(r.right-r.left) - slideReveal; m->edgeVelocityX=850; }
-            else if (side == Edge::Top) { y = -static_cast<float>(r.bottom-r.top) + slideReveal; m->edgeVelocityY=-850; }
-            else { y = static_cast<float>(r.bottom-r.top) - slideReveal; m->edgeVelocityY=850; }
-            m->edgePulse=.72f;
-        } else {
-            if (side == Edge::Left) m->edgeVelocityX=850;
-            else if (side == Edge::Right) m->edgeVelocityX=-850;
-            else if (side == Edge::Top) m->edgeVelocityY=850;
-            else m->edgeVelocityY=-850;
-            m->edgePulse=.50f;
-        }
-        m->targetOffsetX=x; m->targetOffsetY=y;
-        if (!m->edgeClip && m->compositionDevice)
-            m->compositionDevice->CreateRectangleClip(&m->edgeClip);
-        if (m->edgeClip) {
-            const float reveal=10.0f;
-            const float longSide=52.0f;
-            if (collapsed) {
-                if (side==Edge::Left) {
-                    m->edgeClip->SetLeft(static_cast<float>(r.right-r.left)-reveal);m->edgeClip->SetRight(static_cast<float>(r.right-r.left));m->edgeClip->SetTop((r.bottom-r.top-longSide)*.5f);m->edgeClip->SetBottom((r.bottom-r.top+longSide)*.5f);
-                } else if (side==Edge::Right) {
-                    m->edgeClip->SetLeft(0.0f);m->edgeClip->SetRight(reveal);m->edgeClip->SetTop((r.bottom-r.top-longSide)*.5f);m->edgeClip->SetBottom((r.bottom-r.top+longSide)*.5f);
-                } else if (side==Edge::Top) {
-                    m->edgeClip->SetLeft((r.right-r.left-longSide)*.5f);m->edgeClip->SetRight((r.right-r.left+longSide)*.5f);m->edgeClip->SetTop(static_cast<float>(r.bottom-r.top)-reveal);m->edgeClip->SetBottom(static_cast<float>(r.bottom-r.top));
-                } else {
-                    m->edgeClip->SetLeft((r.right-r.left-longSide)*.5f);m->edgeClip->SetRight((r.right-r.left+longSide)*.5f);m->edgeClip->SetTop(0.0f);m->edgeClip->SetBottom(reveal);
-                }
-                m->compositionVisual->SetClip(m->edgeClip);
-            } else {
-                m->compositionVisual->SetClip(nullptr);
-            }
-        }
-        SetTimer(m->hwnd, 43, 16, nullptr);
-    }
     render();
 }
 bool Window::edgeCollapsed() const{return m->collapsed;}

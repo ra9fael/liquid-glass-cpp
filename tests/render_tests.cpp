@@ -3,6 +3,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <d2d1_3.h>
+#include <dwmapi.h>
 void require(bool value,const char* message);
 int channel(const liquid_glass::Image& image,int x,int y,int c);
 LRESULT CALLBACK backgroundProc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
@@ -24,7 +25,7 @@ void settle(liquid_glass::Window& window) {
 
 void desktopTest() {
     WNDCLASSW cls{};cls.lpfnWndProc=backgroundProc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"GlassTestBackdrop";RegisterClassW(&cls);
-    HWND background=CreateWindowExW(WS_EX_TOPMOST,cls.lpszClassName,L"",WS_POPUP|WS_VISIBLE,600,300,600,400,nullptr,nullptr,cls.hInstance,nullptr);
+    HWND background=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,cls.lpszClassName,L"",WS_POPUP,500,200,800,600,nullptr,nullptr,cls.hInstance,nullptr);
     require(background!=nullptr,"desktop background window");
     liquid_glass::Window window;
     float luminance=0;
@@ -35,10 +36,11 @@ void desktopTest() {
         if(brush){f.context->FillRectangle(D2D1::RectF(60,40,180,120),brush);brush->Release();}
     };
     auto fill=[&](int gray){
-        SetWindowPos(background,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-        const auto bounds=window.geometry();
-        window.show(bounds);
-        SetWindowLongPtrW(background,GWLP_USERDATA,gray);InvalidateRect(background,nullptr,FALSE);UpdateWindow(background);
+        SetWindowLongPtrW(background,GWLP_USERDATA,gray);
+        SetWindowPos(background,HWND_TOPMOST,500,200,800,600,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        RedrawWindow(background,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ERASE);
+        SetWindowPos(window.hwnd(),HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        DwmFlush();
     };
     for(bool visible:{false,true}) {
         window.setCaptureVisible(visible);
@@ -75,6 +77,8 @@ void desktopTest() {
             require(SUCCEEDED(window.lastError()),"desktop resize HRESULT");
             const auto resized=window.snapshot();
             require(resized.width==width&&resized.height==height,"desktop resize dimensions");
+            SetWindowDisplayAffinity(window.hwnd(),WDA_NONE);
+            DwmFlush();
             HDC screen=GetDC(nullptr);
             bool corners=true;
             for(POINT p : {POINT{700,400},POINT{700+width-1,400},POINT{700,400+height-1},POINT{700+width-1,400+height-1}}) {
@@ -84,6 +88,7 @@ void desktopTest() {
             }
             const COLORREF content=GetPixel(screen,800,480);
             ReleaseDC(nullptr,screen);
+            window.setCaptureVisible(visible);
             require(corners,"resized desktop corners reveal background");
             require(GetRValue(content)>230&&GetGValue(content)<20,"resized desktop content remains visible");
         }
@@ -137,6 +142,22 @@ int main(){
             const int b=channel(blurred,x,y,0),g=channel(blurred,x,y,1),r=channel(blurred,x,y,2);
             require(std::abs(b-g)<4&&std::abs(r-g)<4,"neutral blur must treat RGB consistently");
             require(g>80&&g<160,"blur must reduce checker contrast");
+        }
+        window.hide();
+        material.animations=false; window.setMaterial(material);
+        window.show({80,80,240,160});
+        for(auto edge:{liquid_glass::Edge::Left,liquid_glass::Edge::Right,liquid_glass::Edge::Top,liquid_glass::Edge::Bottom}) {
+            window.setEdgeCollapsed(true,edge);window.render();
+            const auto panel=window.snapshot();
+            require(channel(panel,120,80,3)==0,"collapsed panel center is transparent");
+            const auto capsule=window.capsuleSnapshot();
+            require(!capsule.empty(),"half circle snapshot exists");
+            require(channel(capsule,capsule.width/2,capsule.height/2,3)>240,"half circle retains glass");
+            const int outerX=edge==liquid_glass::Edge::Left?capsule.width-1:0;
+            const int outerY=edge==liquid_glass::Edge::Top?capsule.height-1:0;
+            require(channel(capsule,outerX,outerY,3)<10,"half circle outer corner is transparent");
+            window.setEdgeCollapsed(false,edge);window.render();
+            require(channel(window.snapshot(),120,80,3)==255,"expanded panel restores glass");
         }
         window.hide();
         desktopTest();

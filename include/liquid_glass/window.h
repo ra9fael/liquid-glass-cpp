@@ -28,6 +28,7 @@ struct Material {
     bool dark = true;
     bool edgeHide = false;
     bool debugPattern = false;
+    bool animations = true;
     int radius = 22;
     int blur = 34;
     int glass = 72;
