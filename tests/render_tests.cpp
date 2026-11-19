@@ -61,6 +61,8 @@ void desktopTest() {
             require(gray>100?luminance>.7f:luminance<.3f,"stationary desktop luminance follows background");
             require(std::abs(channel(image,x,y,2)-gray)<8,"capture excludes own content");
             require(std::abs(channel(image,x,y,1)-gray)<8,"capture retains underlying background");
+            const auto glass=window.snapshot();
+            if(gray==220) require(channel(glass,30,80,1)>170,"desktop glass must retain bright backdrop");
             HDC screen=GetDC(nullptr);
             for(POINT p : {POINT{700,400},POINT{939,400},POINT{700,559},POINT{939,559}}){
                 COLORREF pixel=GetPixel(screen,p.x,p.y);
@@ -145,6 +147,18 @@ int main(){
         }
         window.hide();
         material.animations=false; window.setMaterial(material);
+        window.show({80,80,240,38});
+        for(auto edge:{liquid_glass::Edge::Left,liquid_glass::Edge::Right}) {
+            window.setEdgeCollapsed(true,edge);window.render();
+            const auto capsule=window.capsuleSnapshot();
+            require(capsule.width==19&&capsule.height==38,"short side constrains side capsule to a semicircle");
+            const int screenEdgeX=edge==liquid_glass::Edge::Left?0:capsule.width-1;
+            const int arcX=edge==liquid_glass::Edge::Left?capsule.width-1:0;
+            require(channel(capsule,arcX,0,3)<10&&channel(capsule,arcX,capsule.height-1,3)<10,"side capsule arc fits short window");
+            require(channel(capsule,screenEdgeX,capsule.height/2,3)>240,"side capsule reaches screen edge");
+            window.setEdgeCollapsed(false,edge);
+        }
+        window.hide();
         window.show({80,80,240,160});
         for(auto edge:{liquid_glass::Edge::Left,liquid_glass::Edge::Right,liquid_glass::Edge::Top,liquid_glass::Edge::Bottom}) {
             window.setEdgeCollapsed(true,edge);window.render();
@@ -156,6 +170,12 @@ int main(){
             const int outerX=edge==liquid_glass::Edge::Left?capsule.width-1:0;
             const int outerY=edge==liquid_glass::Edge::Top?capsule.height-1:0;
             require(channel(capsule,outerX,outerY,3)<10,"half circle outer corner is transparent");
+            const int innerX=edge==liquid_glass::Edge::Right?capsule.width-1:0;
+            const int innerY=edge==liquid_glass::Edge::Bottom?capsule.height-1:0;
+            if(edge==liquid_glass::Edge::Left||edge==liquid_glass::Edge::Right)
+                require(channel(capsule,innerX,capsule.height/2,3)>240,"half circle meets the screen edge");
+            else
+                require(channel(capsule,capsule.width/2,innerY,3)>240,"half circle meets the screen edge");
             window.setEdgeCollapsed(false,edge);window.render();
             require(channel(window.snapshot(),120,80,3)==255,"expanded panel restores glass");
         }
@@ -173,6 +193,39 @@ int main(){
         SetCursorPos(500,500);settle(window);settle(window);settle(window);settle(window);
         require(window.edgeCollapsed(),"click-through pointer exit collapses panel");
         }
+        // Hit testing: a foreign window underneath must get the click back,
+        // both while click-through is on and while the panel is collapsed off
+        // the edge (its rectangle stays where it was, as the capsule's home).
+        window.edgeCollapsedChanged=nullptr;
+        window.setMaterial(material);
+        window.setClickThrough(false);window.setEdgeCollapsed(false,liquid_glass::Edge::Right);
+        window.show({700,400,240,160});
+        WNDCLASSW hit{};hit.lpfnWndProc=backgroundProc;hit.hInstance=GetModuleHandleW(nullptr);hit.lpszClassName=L"GlassTestHitTarget";
+        RegisterClassW(&hit);
+        HWND target=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,hit.lpszClassName,L"",WS_POPUP,
+            500,200,800,600,nullptr,nullptr,hit.hInstance,nullptr);
+        require(target!=nullptr,"hit test target window");
+        SetWindowLongPtrW(target,GWLP_USERDATA,110);
+        SetWindowPos(target,HWND_TOPMOST,500,200,800,600,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        SetWindowPos(window.hwnd(),HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        DwmFlush();
+        auto exStyle=[&]{return GetWindowLongPtrW(window.hwnd(),GWL_EXSTYLE);};
+        auto through=[&]{return (exStyle()&WS_EX_TRANSPARENT)!=0;};
+        require((exStyle()&WS_EX_LAYERED)!=0,"window is layered");
+        require(!through(),"shown panel takes the mouse");
+        require(WindowFromPoint(POINT{820,480})==window.hwnd(),"shown panel owns the point");
+        window.setClickThrough(true);
+        require(through(),"click-through leaves hit testing");
+        require(WindowFromPoint(POINT{820,480})==target,"click-through reaches the window underneath");
+        window.setClickThrough(false);
+        window.setEdgeCollapsed(true,liquid_glass::Edge::Right);
+        require(through(),"collapsed panel leaves hit testing");
+        require(WindowFromPoint(POINT{820,480})==target,"collapsed panel's old area reaches the window underneath");
+        window.render();
+        require(channel(window.snapshot(),120,80,3)==0,"collapsed panel is still drawn transparent");
+        window.setEdgeCollapsed(false,liquid_glass::Edge::Right);
+        require(!through(),"expanded panel takes the mouse again");
+        window.hide();DestroyWindow(target);
         SetCursorPos(original.x,original.y);
         std::cout<<"liquid_glass_render: all checks passed\n";
         return 0;

@@ -9,6 +9,7 @@
 #include <dxgi1_2.h>
 #include <windows.h>
 #include <windowsx.h>
+#include <wtsapi32.h>
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,7 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
@@ -39,6 +41,12 @@ template <typename T> void release(T*& value)
 }
 
 constexpr wchar_t kClassName[] = L"LiquidGlassCppWindow";
+
+float capsuleRadius(Edge edge, float scale, float width, float height)
+{
+    const float available = edge == Edge::Left || edge == Edge::Right ? height : width;
+    return std::min(26.0f * scale, std::max(1.0f, available * 0.5f));
+}
 
 const char* kGlassShader = R"(
 cbuffer Frame : register(b0) {
@@ -93,10 +101,15 @@ float4 PS(VOut input) : SV_TARGET {
     float2 p = input.uv * size - size * .5;
     float corner = min(radius, min(size.x,size.y) * .42);
     float d = sdRoundRect(p, size * .5 - 1.0, corner);
-    float2 anchor = morph.y < .5 ? float2(-size.x*.5,0) : morph.y < 1.5 ? float2(size.x*.5,0) : morph.y < 2.5 ? float2(0,-size.y*.5) : float2(0,size.y*.5);
+    float capsuleRadius = morph.z;
+    float2 collapsedHalfSize = float2(capsuleRadius, capsuleRadius);
+    float2 anchor = morph.y < .5 ? float2(-size.x*.5,0)
+        : morph.y < 1.5 ? float2(size.x*.5,0)
+        : morph.y < 2.5 ? float2(0,-size.y*.5)
+        : float2(0,size.y*.5);
     float2 center = lerp(float2(0,0), anchor, morph.x);
-    float2 halfSize = lerp(size*.5-1, float2(morph.z,morph.z), morph.x);
-    corner = lerp(corner,morph.z,morph.x);
+    float2 halfSize = lerp(size*.5-1, collapsedHalfSize, morph.x);
+    corner = lerp(corner, capsuleRadius, morph.x);
     d = sdRoundRect(p-center,halfSize,corner);
     float coverage = 1.0 - smoothstep(-max(fwidth(d), .75), max(fwidth(d), .75), d);
     float edge = 1.0 - smoothstep(0.0, max(3.0, corner), -d);
@@ -144,7 +157,7 @@ float4 PS(VOut input) : SV_TARGET {
     color += rimColor * cursorLens * edge * cursorGlow * .11;
     color += sin(dot(p, float2(.035,.052)) + time * 3.0) * edge * speed * .025;
     if(materialStyle.x>1.5) color += pow(max(abs(tile.x),abs(tile.y))*2,16)*.09;
-    if(diagnostic<.5) color=lerp(color,materialStyle.z>.5?float3(.035,.045,.065):float3(.94,.96,.98),lerp(.85,.04,saturate(opacity)));
+    if(diagnostic<.5) color=lerp(color,materialStyle.z>.5?float3(.035,.045,.065):float3(.94,.96,.98),lerp(.30,.02,saturate(opacity)));
     float alpha = coverage;
     return float4(saturate(color) * alpha, alpha);
 }
@@ -246,6 +259,7 @@ struct Window::Impl {
     bool backdropIsDiagnostic = false;
     bool forceDiagnosticPattern = false;
     bool captureVisible = true;
+    bool sessionLocked = false;
     float collapseProgress = 0;
     float pressResponse = 0;
     bool pressed = false;
@@ -257,6 +271,7 @@ struct Window::Impl {
     ULONGLONG lastDrawTick = 0;
 
     bool initDevice();
+    void updateInputStyle();
     void resize(UINT width, UINT height);
     void releaseTarget();
     void ensureDuplication();
@@ -456,7 +471,7 @@ void Window::Impl::createDiagnosticBackdrop()
 
 void Window::Impl::captureBackdrop()
 {
-    if (fixedBackdrop) return;
+    if (fixedBackdrop || sessionLocked) return;
     if (model.debugPattern || forceDiagnosticPattern) { createDiagnosticBackdrop(); return; }
     const ULONGLONG captureNow = GetTickCount64();
     const bool needsFrame = backdropDirty || captureNow - lastBackdropCapture >= 16;
@@ -627,7 +642,7 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
         velocityX + edgeVelocityX, velocityY + edgeVelocityY, edgePulse, (fixedBackdrop || model.debugPattern || forceDiagnosticPattern) ? 1.0f : 0.0f,
         model.dispersion / 100.0f, model.rimLight / 100.0f, model.surfaceMotion / 100.0f, 0,
         localCursorX, localCursorY, model.animations ? model.surfaceMotion / 100.0f : 0, pressResponse,
-        collapseProgress, static_cast<float>(edgeSide), 26.f*model.scale, 0,
+        collapseProgress, static_cast<float>(edgeSide), capsuleRadius(edgeSide, model.scale, static_cast<float>(width), static_cast<float>(height)), 0,
         static_cast<float>(model.style), model.tileSize*model.scale, model.dark?1.f:0.f, 0}};
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (SUCCEEDED(context->Map(frameBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
@@ -710,6 +725,23 @@ void Window::Impl::draw()
     }
 }
 
+// The window is layered throughout; WS_EX_TRANSPARENT takes it out of hit
+// testing, which is the only thing that works across processes (HTTRANSPARENT
+// only hands the message to windows of the same thread). Collapsed panels are
+// transparent too: the panel keeps its full rectangle while it is off the edge,
+// and only the capsule's polling (WM_TIMER 44) brings it back.
+void Window::Impl::updateInputStyle()
+{
+    if (!hwnd) return;
+    const bool wanted = clickThrough || collapsed;
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (((style & WS_EX_TRANSPARENT) != 0) == wanted) return;
+    style = wanted ? (style | WS_EX_TRANSPARENT) : (style & ~WS_EX_TRANSPARENT);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
 LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     auto* impl = reinterpret_cast<Impl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -721,21 +753,24 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
         return DefWindowProcW(hwnd, message, wParam, lParam);
     switch (message) {
     case WM_SIZE: impl->resize(LOWORD(lParam), HIWORD(lParam)); impl->draw(); return 0;
+    case WM_WTSSESSION_CHANGE:
+        if (wParam == WTS_SESSION_LOCK) {
+            impl->sessionLocked = true;
+            release(impl->duplication);
+        } else if (wParam == WTS_SESSION_UNLOCK) {
+            impl->sessionLocked = false;
+            impl->backdropDirty = true;
+            impl->blurDirty = true;
+            impl->lastBackdropCapture = 0;
+            impl->ensureDuplication();
+            impl->draw();
+        }
+        return 0;
     case WM_PAINT: { PAINTSTRUCT paint{}; BeginPaint(hwnd, &paint); impl->draw(); EndPaint(hwnd, &paint); return 0; }
     case WM_NCHITTEST:
-        if (impl->clickThrough) return HTTRANSPARENT;
-        if (impl->collapsed) {
-            POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; RECT rect{}; GetWindowRect(hwnd, &rect);
-            const bool right = impl->edgeSide == Edge::Right;
-            const bool left = impl->edgeSide == Edge::Left;
-            const bool top = impl->edgeSide == Edge::Top;
-            const int x = point.x - rect.left, y = point.y - rect.top;
-            const float radius=26.f*impl->model.scale;
-            const float dx=right?x-(rect.right-rect.left):left?x:x-(rect.right-rect.left)*.5f;
-            const float dy=top?y:(!right&&!left)?y-(rect.bottom-rect.top):y-(rect.bottom-rect.top)*.5f;
-            const bool strip = dx*dx+dy*dy<=radius*radius;
-            return strip ? HTCLIENT : HTTRANSPARENT;
-        }
+        // Same-thread fallback; the cross-process answer is WS_EX_TRANSPARENT
+        // (updateInputStyle), which keeps this message from arriving at all.
+        if (impl->clickThrough || impl->collapsed) return HTTRANSPARENT;
         return HTCLIENT;
     case WM_LBUTTONDOWN:
         impl->pressed=true;
@@ -791,9 +826,12 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
         return 0;
     case WM_TIMER:
         if(wParam==44 && IsWindowVisible(hwnd)) {
-            if(impl->clickThrough && impl->model.edgeHide && impl->owner->edgeCollapsedChanged) {
+            // Polled whenever the panel cannot hear the mouse itself: taken out
+            // of hit testing by click-through, or collapsed but still needing
+            // its capsule hovered.
+            if((impl->clickThrough || impl->collapsed) && impl->model.edgeHide && impl->owner->edgeCollapsedChanged) {
                 POINT cursor{};GetCursorPos(&cursor);RECT r{};GetWindowRect(hwnd,&r);
-                const float radius=26.f*impl->model.scale;
+                const float radius=capsuleRadius(impl->edgeSide, impl->model.scale, static_cast<float>(r.right-r.left), static_cast<float>(r.bottom-r.top));
                 const float cx=impl->edgeSide==Edge::Left?r.left:impl->edgeSide==Edge::Right?r.right:(r.left+r.right)*.5f;
                 const float cy=impl->edgeSide==Edge::Top?r.top:impl->edgeSide==Edge::Bottom?r.bottom:(r.top+r.bottom)*.5f;
                 if(impl->collapsed && (cursor.x-cx)*(cursor.x-cx)+(cursor.y-cy)*(cursor.y-cy)<=radius*radius) {
@@ -860,10 +898,10 @@ Image Window::Impl::capsuleSnapshot() const
     if (!collapsed) return {};
     const Image panel = snapshot();
     if (panel.empty()) return {};
-    const int width = static_cast<int>(std::ceil(26*model.scale));
-    const int longSide = width*2;
     const bool vertical=edgeSide==Edge::Left||edgeSide==Edge::Right;
-    Image result; result.width=std::min(panel.width,vertical?width:longSide); result.height=std::min(panel.height,vertical?longSide:width);
+    const int radius = static_cast<int>(std::ceil(capsuleRadius(edgeSide, model.scale, static_cast<float>(panel.width), static_cast<float>(panel.height))));
+    const int longSide = radius*2;
+    Image result; result.width=std::min(panel.width,vertical?radius:longSide); result.height=std::min(panel.height,vertical?longSide:radius);
     const int x=vertical?(edgeSide==Edge::Right?panel.width-result.width:0):(panel.width-result.width)/2;
     const int y=vertical?(panel.height-result.height)/2:(edgeSide==Edge::Bottom?panel.height-result.height:0);
     result.pixels.resize(result.width*result.height*4);
@@ -901,9 +939,12 @@ bool Window::create()
         WNDCLASSW wc{}; wc.hInstance=GetModuleHandleW(nullptr); wc.lpszClassName=kClassName; wc.lpfnWndProc=Impl::wndProc;
         wc.hCursor=LoadCursorW(nullptr, IDC_ARROW); registered = RegisterClassW(&wc) || GetLastError()==ERROR_CLASS_ALREADY_EXISTS;
     }
-    m->hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP|WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE, kClassName, L"Liquid Glass", WS_POPUP,
+    m->hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP|WS_EX_LAYERED|WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE, kClassName, L"Liquid Glass", WS_POPUP,
                              0,0,1,1,nullptr,nullptr,GetModuleHandleW(nullptr),m.get());
     if (!m->hwnd || !m->initDevice()) return false;
+    // A layered window is only composed once its attributes are set; 255 keeps
+    // DirectComposition's alpha, which is what draws the glass.
+    SetLayeredWindowAttributes(m->hwnd, 0, 255, LWA_ALPHA);
     SetWindowDisplayAffinity(m->hwnd, WDA_EXCLUDEFROMCAPTURE);
     IDXGIDevice* dxgi = nullptr;
     if (FAILED(m->device->QueryInterface(IID_PPV_ARGS(&dxgi)))) return false;
@@ -919,6 +960,7 @@ bool Window::create()
     if (SUCCEEDED(created)) created = m->compositionDevice->Commit();
     release(factory); release(adapter); release(dxgi);
     if (FAILED(created)) return false;
+    WTSRegisterSessionNotification(m->hwnd, NOTIFY_FOR_THIS_SESSION);
     SetTimer(m->hwnd,44,16,nullptr);
     return true;
 }
@@ -927,7 +969,10 @@ void Window::destroy()
 {
     if (!m) return;
     release(m->timingDisjoint);release(m->timingStart);release(m->timingEnd);m->timingPending=false;
-    if (m->hwnd) DestroyWindow(m->hwnd);
+    if (m->hwnd) {
+        WTSUnRegisterSessionNotification(m->hwnd);
+        DestroyWindow(m->hwnd);
+    }
     m->hwnd=nullptr; m->releaseTarget(); release(m->frameBuffer); release(m->blurBuffer); release(m->pixelShader); release(m->downsampleShader); release(m->kawaseShader); release(m->vertexShader); release(m->swapChain);
     release(m->edgeClip); release(m->compositionVisual); release(m->compositionTarget); release(m->compositionDevice);
     release(m->backdropView); release(m->backdrop); release(m->blurPingView); release(m->blurPongView); release(m->blurPingTarget); release(m->blurPongTarget); release(m->blurPing); release(m->blurPong); release(m->duplication); release(m->sampler);
@@ -940,7 +985,7 @@ bool Window::visible() const{return m->hwnd&&IsWindowVisible(m->hwnd);}
 HWND Window::hwnd() const{return m->hwnd;}
 Rect Window::geometry() const{RECT r{};if(m->hwnd)GetWindowRect(m->hwnd,&r);return {r.left,r.top,r.right-r.left,r.bottom-r.top};}
 void Window::setGeometry(const Rect& geometry){if(m->hwnd){m->backdropDirty=true;SetWindowPos(m->hwnd,HWND_TOPMOST,geometry.x,geometry.y,geometry.width,geometry.height,SWP_NOACTIVATE);}}
-void Window::setClickThrough(bool enabled){m->clickThrough=enabled;}
+void Window::setClickThrough(bool enabled){m->clickThrough=enabled;m->updateInputStyle();}
 void Window::setCaptureVisible(bool enabled){
     m->captureVisible=enabled;
     if(m->hwnd)SetWindowDisplayAffinity(m->hwnd, enabled ? WDA_NONE : WDA_EXCLUDEFROMCAPTURE);
@@ -952,6 +997,7 @@ void Window::setMaterial(Material model){
 }
 void Window::setEdgeCollapsed(bool collapsed,Edge side){
     m->collapsed=collapsed;m->edgeSide=side;
+    m->updateInputStyle();
     render();
 }
 bool Window::edgeCollapsed() const{return m->collapsed;}
