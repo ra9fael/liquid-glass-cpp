@@ -207,39 +207,53 @@ int main(int argc,char** argv){
             liquid_glass::Window probe;
             require(probe.create(),"create free-hide window");
             liquid_glass::Material material; material.animations=true; material.edgeHide=true;
-            material.freeHideEnabled=true; material.freeHideDelayMs=1400;
+            material.freeHideEnabled=true; material.freeHideDelayMs=1800;
             material.blur=0;material.refraction=0;material.dispersion=0;material.rimLight=0;material.surfaceMotion=0;
             probe.setMaterial(material);
             liquid_glass::Image backdrop;backdrop.width=240;backdrop.height=160;backdrop.pixels.resize(240*160*4,255);
             probe.setBackdrop(backdrop);probe.show({200,180,240,160});
             POINT cursor{};GetCursorPos(&cursor);
             auto tick=[&]{MSG msg{};while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}probe.render();Sleep(16);};
+            SetCursorPos(230,225);
+            SendMessageW(probe.hwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(30,45));
+            SetCursorPos(237,254);
+            SendMessageW(probe.hwnd(), WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(37,74));
+            SendMessageW(probe.hwnd(), WM_LBUTTONUP, 0, MAKELPARAM(37,74));
+            for(int i=0;i<8;++i)tick();
+            SetCursorPos(270,290);
+            SendMessageW(probe.hwnd(), WM_MOUSEMOVE, 0, MAKELPARAM(70,110));
             SetCursorPos(1000,900);
             const auto started=GetTickCount64();
             while(GetTickCount64()-started<350)tick();
             auto image=probe.snapshot();
             require(channel(image,120,80,3)==255,"free panel remains expanded before delay");
-            Sleep(850);
+            Sleep(900);
             for(int i=0;i<12;++i)tick();
             image=probe.snapshot();
             const auto visiblePixels=[](const liquid_glass::Image& frame){int count=0;for(int y=0;y<frame.height;++y)for(int x=0;x<frame.width;++x)count+=channel(frame,x,y,3)>0;return count;};
-            require(channel(image,120,80,3)==255,"both hide modes leave an unsnapped panel expanded before the free-hide delay");
-            Sleep(650);
+            require(channel(image,30,45,3)==255,"hover movement does not replace the drag release anchor");
+            Sleep(900);
             for(int i=0;i<12;++i)tick();
             image=probe.snapshot();
             const int midpoint=visiblePixels(image);
             require(midpoint>0&&midpoint<240*160,"free hide uses an animated intermediate shape when edge and free hide are both enabled");
             for(int i=0;i<60;++i)tick();
             image=probe.snapshot();
-            require(visiblePixels(image)<240*160/2,"free hide reaches its centered trigger shape when edge and free hide are both enabled");
-            SetCursorPos(320,260);
+            require(visiblePixels(image)<240*160/2,"free hide reaches its release-point trigger shape when edge and free hide are both enabled");
+            RECT currentRect{}; GetWindowRect(probe.hwnd(), &currentRect);
+            require(probe.hitTestCollapsedCapsule({currentRect.left + 30, currentRect.top + 45}),
+                    "free-hide trigger hit test follows the saved release point");
+            require(!probe.hitTestCollapsedCapsule({currentRect.left + 70, currentRect.top + 110}),
+                    "hover movement does not shift the free-hide trigger");
+            SetCursorPos(currentRect.left + 30, currentRect.top + 45);
             for(int i=0;i<15;++i)tick();
             image=probe.snapshot();
             const int wakeMidpoint=visiblePixels(image);
             require(wakeMidpoint>0&&wakeMidpoint<240*160,"free wake uses an animated intermediate shape");
             for(int i=0;i<60;++i)tick();
             image=probe.snapshot();
-            require(channel(image,120,80,3)==255,"hovering trigger restores the full panel when both hide modes are enabled");
+            require(channel(image,37,74,3)==255,
+                    "free-hide animation fully restores content after waking at the saved release point");
             SetCursorPos(cursor.x,cursor.y);probe.hide();
             std::cout<<"free_hide_window: delay, animated collapse, wake and animated reveal passed\\n";
             return 0;
@@ -258,13 +272,19 @@ int main(int argc,char** argv){
             require(collapsed.first==19&&collapsed.last==71,"collapse returns to the saved pointer anchor");
             require(liquid_glass::capsuleHit(100,100,100,100,26),"pointer anchor hits capsule");
             require(!liquid_glass::capsuleHit(100,127,100,100,26),"pointer outside capsule does not hit");
-            const auto circle = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 14, 26, 20, 0, 0, 0);
-            const auto restored = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 14, 26, 20, 1, 0, 0);
+            const auto circle = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 30, 26, 20, 0, 0, 0, 45);
+            const auto restored = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 30, 26, 20, 1, 0, 0, 45);
             require(std::abs((circle.right - circle.left) - 52.f) < .01f &&
-                    std::abs((circle.bottom - circle.top) - 52.f) < .01f,
-                    "free-hide trigger is a complete circle");
+                    std::abs((circle.bottom - circle.top) - 52.f) < .01f &&
+                    std::abs((circle.left + circle.right) * .5f - 30.f) < .01f &&
+                    std::abs((circle.top + circle.bottom) * .5f - 45.f) < .01f,
+                    "free-hide trigger is centered on the drag release point");
             require(restored.left == 1 && restored.top == 1 && restored.right == 239 && restored.bottom == 159,
                     "free-hide reveal restores the full panel rectangle");
+            const auto centeredCircle = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 120, 26, 20, 0, 0, 0);
+            require(std::abs((centeredCircle.left + centeredCircle.right) * .5f - 120.f) < .01f &&
+                    std::abs((centeredCircle.top + centeredCircle.bottom) * .5f - 80.f) < .01f,
+                    "free-hide trigger defaults to panel center before a release anchor is recorded");
             require(std::abs(liquid_glass::animationEase(.5f, 0) - .5f) < .001f &&
                     liquid_glass::animationEase(.5f, 1) > .5f &&
                     liquid_glass::animationEase(.5f, 3) < .5f &&

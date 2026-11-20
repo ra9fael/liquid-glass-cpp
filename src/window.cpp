@@ -136,7 +136,7 @@ float4 PS(VOut input) : SV_TARGET {
     refractedUv += flow * refractBand * speed * 1.5 / desktopSize;
     float cursorDistance = length(p - cursor);
     float cursorLens = exp(-cursorDistance * cursorDistance / max(800.0, min(size.x,size.y) * min(size.x,size.y) * .10));
-    refractedUv += (p-cursor) * cursorLens * cursorGlow * (.12 + cursorAndLighting.w*.18) * interior / desktopSize;
+    refractedUv += (p-cursor) * cursorLens * cursorGlow * (.12 + cursorAndLighting.w*.18) / desktopSize;
     refractedUv += flow * speed * sin(time*8-length(p)*.035) * 3 / desktopSize;
     float2 tile = frac(input.uv*size/max(materialStyle.y,8))-.5;
     if(materialStyle.x>1.5) refractedUv += sin(tile*6.283185)*refraction*.06*interior/desktopSize;
@@ -279,6 +279,7 @@ struct Window::Impl {
     bool collapsed = false;
     Edge edgeSide = Edge::Right;
     bool freeCollapsed = false;
+    std::optional<Point> freeAnchor;
     bool wakeOnEntry = false;
     int workAreaFirst = 0;
     int workAreaLast = 0;
@@ -692,12 +693,15 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     const float workFirst=hasWorkArea?static_cast<float>(workAreaFirst)-workOrigin:0.f;
     const float workLast=hasWorkArea?static_cast<float>(workAreaLast)-workOrigin:length;
     const Edge shapeEdge=freeCollapsed?Edge::Center:edgeSide;
-    const float shapeAlong=freeCollapsed?static_cast<float>(verticalEdge(edgeSide)?height:width)*.5f:localAnchor(windowRect);
+    const float shapeAlong=freeCollapsed && freeAnchor ? static_cast<float>(freeAnchor->x)
+                                                        : freeCollapsed ? static_cast<float>(width)*.5f
+                                                                        : localAnchor(windowRect);
     const float shapeFirst=freeCollapsed?0.f:workFirst;
     const float shapeLast=freeCollapsed?length:workLast;
     const PanelShape shape=panelShape(static_cast<float>(width),static_cast<float>(height),shapeEdge,
         shapeAlong,capsuleRadius(edgeSide,model.scale,static_cast<float>(width),static_cast<float>(height)),
-        panelRadius,1.f-revealProgress,shapeFirst,shapeLast);
+        panelRadius,1.f-revealProgress,shapeFirst,shapeLast,
+        freeCollapsed && freeAnchor ? static_cast<float>(freeAnchor->y) : -1.f);
     frame.v[24]=shape.left; frame.v[25]=shape.top; frame.v[26]=shape.right; frame.v[27]=shape.bottom;
     frame.v[32]=shape.radius;
     frame.v[33]=shape.curve;
@@ -780,9 +784,11 @@ void Window::Impl::draw()
         const float workLast=hasWorkArea?static_cast<float>(workAreaLast)-workOrigin:length;
         const float panelRadius=std::min({static_cast<float>(model.radius),width*.5f,height*.5f});
         const Edge shapeEdge=freeCollapsed?Edge::Center:edgeSide;
-        const float shapeAlong=freeCollapsed?(verticalEdge(edgeSide)?height:width)*.5f:along;
+        const float shapeAlong=freeCollapsed && freeAnchor ? static_cast<float>(freeAnchor->x)
+                                                            : freeCollapsed ? width*.5f : along;
         const PanelShape shape=panelShape(width,height,shapeEdge,shapeAlong,radius,panelRadius,1.f-revealProgress,
-            freeCollapsed?0.f:workFirst,freeCollapsed?length:workLast);
+            freeCollapsed?0.f:workFirst,freeCollapsed?length:workLast,
+            freeCollapsed && freeAnchor ? static_cast<float>(freeAnchor->y) : -1.f);
         d2d->BeginDraw();
         ID2D1PathGeometry* geometry=nullptr;
         ID2D1GeometrySink* sink=nullptr;
@@ -907,12 +913,15 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
         return DefWindowProcW(hwnd, message, wParam, lParam);
     case WM_LBUTTONUP:
         impl->pressed=false;
-        if (impl->dragging) {
-            impl->dragging=false; ReleaseCapture();
-            RECT r{}; GetWindowRect(hwnd,&r);
-            POINT cursor{}; GetCursorPos(&cursor);
-            if(impl->owner->moved) impl->owner->moved({r.left,r.top}, {cursor.x,cursor.y});
-            impl->pointerOutsideSince = 0;
+        {
+            if (impl->dragging) {
+                RECT r{}; GetWindowRect(hwnd,&r);
+                POINT cursor{}; GetCursorPos(&cursor);
+                impl->freeAnchor = Point{cursor.x - r.left, cursor.y - r.top};
+                impl->dragging=false; ReleaseCapture();
+                if(impl->owner->moved) impl->owner->moved({r.left,r.top}, {cursor.x,cursor.y});
+                impl->pointerOutsideSince = 0;
+            }
         }
         return 0;
     case WM_RBUTTONUP:
@@ -1196,8 +1205,10 @@ bool Window::hitTestCollapsedCapsule(Point point) const
     const float radius = capsuleRadius(m->edgeSide, m->model.scale, width, height);
     if (m->freeCollapsed) {
         const float diameter = std::max(2.f, std::min({radius * 2.f, width - 2.f, height - 2.f}));
-        const float dx = static_cast<float>(point.x) - (rect.left + rect.right) * .5f;
-        const float dy = static_cast<float>(point.y) - (rect.top + rect.bottom) * .5f;
+        const float centerX = rect.left + (m->freeAnchor ? m->freeAnchor->x : width * .5f);
+        const float centerY = rect.top + (m->freeAnchor ? m->freeAnchor->y : height * .5f);
+        const float dx = static_cast<float>(point.x) - centerX;
+        const float dy = static_cast<float>(point.y) - centerY;
         return dx * dx + dy * dy <= diameter * diameter * .25f;
     }
     const float along=m->localAnchor(rect);
