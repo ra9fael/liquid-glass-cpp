@@ -68,6 +68,8 @@ cbuffer Frame : register(b0) {
     float4 shapeBounds;
     float4 materialStyle;
     float4 revealSpan;
+    float4 revealAndCaptureScale;
+    float4 cursorMotionControls;
 };
 struct VOut { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
 Texture2D backdrop : register(t0);
@@ -107,7 +109,7 @@ float4 PS(VOut input) : SV_TARGET {
     float rimLight = opticalControls.y;
     float surfaceMotion = opticalControls.z;
     float2 cursor = cursorAndLighting.xy;
-    float cursorGlow = cursorAndLighting.z;
+    float cursorGlow = cursorAndLighting.z * cursorMotionControls.x;
     float2 localPosition = input.uv * size;
     float2 p = localPosition - size * .5;
     float corner = min(radius, min(size.x,size.y) * .42);
@@ -125,7 +127,7 @@ float4 PS(VOut input) : SV_TARGET {
     float2 flow = length(velocity) > .1 ? normalize(velocity) : float2(0,0);
     float leading = dot(normal, flow);
     float thickness = 1.0 + leading * speed * .32;
-    float2 captureScale = max(revealSpan.zw, float2(.001,.001));
+    float2 captureScale = max(revealAndCaptureScale.zw, float2(.001,.001));
     float2 rawUv = diagnostic > .5 ? input.uv : (desktopOrigin + input.uv * size * captureScale) / desktopSize;
     float refractBand = 1.0 - sqrt(max(0.0, 1.0 - edge * edge));
     float2 displacement = normal * thickness * refractBand * refraction * .28 / desktopSize;
@@ -358,7 +360,7 @@ bool Window::Impl::initDevice()
     if (!shaders)
         return false;
     D3D11_BUFFER_DESC buffer{};
-    buffer.ByteWidth = 160;
+    buffer.ByteWidth = 176;
     buffer.Usage = D3D11_USAGE_DYNAMIC;
     buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     buffer.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -666,7 +668,7 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     POINT screenCursor{}; GetCursorPos(&screenCursor);
     const float localCursorX = static_cast<float>(screenCursor.x - desktop.left - width * .5f);
     const float localCursorY = static_cast<float>(screenCursor.y - desktop.top - height * .5f);
-    struct Frame { float v[36]; } frame{{
+    struct Frame { float v[44]; } frame{{
         static_cast<float>(width), static_cast<float>(height), static_cast<float>(model.radius), model.glass / 100.0f,
         static_cast<float>(model.style==1?100:model.blur), static_cast<float>(model.style==1?model.refraction*.15f:model.refraction), static_cast<float>(now % 100000) / 1000.0f, model.animations?1.0f:0.0f,
         desktopW, desktopH,
@@ -674,10 +676,12 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
         static_cast<float>(desktop.top - outputDesc.DesktopCoordinates.top) * backdropScaleY - backdropTop,
         velocityX + edgeVelocityX, velocityY + edgeVelocityY, edgePulse, (fixedBackdrop || model.debugPattern || forceDiagnosticPattern) ? 1.0f : 0.0f,
         model.dispersion / 100.0f, model.rimLight / 100.0f, model.surfaceMotion / 100.0f, 0,
-        localCursorX, localCursorY, model.animations ? model.surfaceMotion / 100.0f : 0, pressResponse,
+        localCursorX, localCursorY, model.animations && !dragging ? model.surfaceMotion / 100.0f : 0, pressResponse,
         0, 0, 0, 0,
         static_cast<float>(model.style), model.tileSize*model.scale, model.dark?1.f:0.f, 0,
-        0, 0, 0, 0}};
+        0, 0, 0, 0,
+        revealProgress, backdropScaleX, backdropScaleY, 0,
+        dragging ? 0.f : 1.f, 0, 0, 0}};
     D3D11_MAPPED_SUBRESOURCE mapped{};
     RECT windowRect{}; GetWindowRect(hwnd, &windowRect);
     const float panelRadius=std::min({static_cast<float>(model.radius),static_cast<float>(width)*.5f,static_cast<float>(height)*.5f});
@@ -697,6 +701,7 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     frame.v[32]=shape.radius;
     frame.v[33]=shape.curve;
     frame.v[34]=revealProgress;
+    frame.v[35]=1.f;
     frame.v[36]=backdropScaleX;
     frame.v[37]=backdropScaleY;
     if (SUCCEEDED(context->Map(frameBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
@@ -932,6 +937,8 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
                     impl->wakeOnEntry = false;
                     if (impl->freeCollapsed)
                         impl->owner->setFreeCollapsed(false);
+                    else if (impl->owner->edgeCollapsedChanged)
+                        impl->owner->edgeCollapsedChanged(false);
                     else
                         impl->owner->setCollapsed(false);
                 }
@@ -941,14 +948,14 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
                 const auto now = GetTickCount64();
                 if (!impl->pointerOutsideSince) impl->pointerOutsideSince = now;
                 const auto elapsed = now - impl->pointerOutsideSince;
-                const bool freeDue = impl->model.freeHideEnabled && impl->model.freeHideDelayMs > 0 &&
-                    elapsed >= static_cast<ULONGLONG>(impl->model.freeHideDelayMs);
+                const bool freeDue = !impl->model.edgeHide && impl->model.freeHideEnabled &&
+                    impl->model.freeHideDelayMs > 0 && elapsed >= static_cast<ULONGLONG>(impl->model.freeHideDelayMs);
                 const bool edgeDue = impl->model.edgeHide && elapsed >= 700;
                 const bool didEdgeCollapse = edgeDue && impl->owner->edgeCollapsedChanged &&
                     impl->owner->edgeCollapsedChanged(true);
                 if (didEdgeCollapse) {
                     impl->pointerOutsideSince = 0;
-                } else if (freeDue) {
+                } else if (freeDue && !impl->model.edgeHide) {
                     impl->owner->setFreeCollapsed(true);
                     impl->pointerOutsideSince = 0;
                 }
@@ -1189,7 +1196,7 @@ bool Window::hitTestCollapsedCapsule(Point point) const
     const float width=static_cast<float>(rect.right-rect.left),height=static_cast<float>(rect.bottom-rect.top);
     const float radius = capsuleRadius(m->edgeSide, m->model.scale, width, height);
     if (m->freeCollapsed) {
-        const float diameter = std::min({radius * 2.f, width - 2.f, height - 2.f});
+        const float diameter = std::max(2.f, std::min({radius * 2.f, width - 2.f, height - 2.f}));
         const float dx = static_cast<float>(point.x) - (rect.left + rect.right) * .5f;
         const float dy = static_cast<float>(point.y) - (rect.top + rect.bottom) * .5f;
         return dx * dx + dy * dy <= diameter * diameter * .25f;
@@ -1200,7 +1207,7 @@ bool Window::hitTestCollapsedCapsule(Point point) const
     const bool hasWorkArea=m->workAreaFirst!=0||m->workAreaLast!=0;
     const float workOrigin=verticalEdge(m->edgeSide)?static_cast<float>(rect.top):static_cast<float>(rect.left);
     const PanelShape shape=panelShape(width,height,shapeEdge,shapeAlong,radius,
-        std::min({static_cast<float>(m->model.radius),width*.5f,height*.5f}),1.f-m->revealProgress,
+        std::min({static_cast<float>(m->model.radius),width*.5f,height*.5f}),m->freeCollapsed?0.f:1.f-m->revealProgress,
         hasWorkArea?static_cast<float>(m->workAreaFirst)-workOrigin:0.f,
         hasWorkArea?static_cast<float>(m->workAreaLast)-workOrigin:(verticalEdge(m->edgeSide)?height:width));
     const float localX=static_cast<float>(point.x-rect.left),localY=static_cast<float>(point.y-rect.top);

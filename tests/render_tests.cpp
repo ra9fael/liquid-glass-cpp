@@ -254,14 +254,19 @@ int main(int argc,char** argv){
             require(collapsed.first==19&&collapsed.last==71,"collapse returns to the saved pointer anchor");
             require(liquid_glass::capsuleHit(100,100,100,100,26),"pointer anchor hits capsule");
             require(!liquid_glass::capsuleHit(100,127,100,100,26),"pointer outside capsule does not hit");
-            const auto circle = liquid_glass::panelShape(80, 28, liquid_glass::Edge::Center, 14, 26, 20, 0, 0, 0);
-            require(circle.right - circle.left <= 26 && circle.bottom - circle.top <= 26 &&
-                    std::abs((circle.right - circle.left) - (circle.bottom - circle.top)) < .01f,
-                    "free-hide capsule is a complete circle constrained by the short panel side");
+            const auto circle = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 14, 26, 20, 0, 0, 0);
+            const auto restored = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 14, 26, 20, 1, 0, 0);
+            require(std::abs((circle.right - circle.left) - 52.f) < .01f &&
+                    std::abs((circle.bottom - circle.top) - 52.f) < .01f,
+                    "free-hide trigger is a complete circle");
+            require(restored.left == 1 && restored.top == 1 && restored.right == 239 && restored.bottom == 159,
+                    "free-hide reveal restores the full panel rectangle");
             require(std::abs(liquid_glass::animationEase(.5f, 0) - .5f) < .001f &&
                     liquid_glass::animationEase(.5f, 1) > .5f &&
-                    liquid_glass::animationEase(.5f, 3) < .5f,
-                    "animation curves provide linear, ease-out and ease-in progress");
+                    liquid_glass::animationEase(.5f, 3) < .5f &&
+                    liquid_glass::animationEase(.8f, 4) > 1.f &&
+                    std::abs(liquid_glass::animationEase(1.f, 4) - 1.f) < .001f,
+                    "animation curves include bounded-endpoint overshoot");
             const auto topCorner=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,.5f,0,300);
             const auto topRest=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,0,0,300);
             const auto topFull=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,1,0,300);
@@ -426,7 +431,7 @@ int main(int argc,char** argv){
         material.edgeHide=true; window.setMaterial(material);window.setClickThrough(true);
         POINT original{};GetCursorPos(&original);
         for(auto edge:{liquid_glass::Edge::Left,liquid_glass::Edge::Right,liquid_glass::Edge::Top,liquid_glass::Edge::Bottom}) {
-        window.edgeCollapsedChanged=[&,edge](bool collapsed){window.setEdgeCollapsed(collapsed,edge);return collapsed;};
+        window.edgeCollapsedChanged=[&,edge](bool collapsed){window.setEdgeCollapsed(collapsed,edge);return true;};
         std::cout<<"click-through edge="<<static_cast<int>(edge)<<std::endl;
         window.show({80,80,240,160});window.setEdgeCollapsed(true,edge);
         SetCursorPos(edge==liquid_glass::Edge::Left?80:edge==liquid_glass::Edge::Right?319:200,
