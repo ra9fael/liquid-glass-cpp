@@ -1,5 +1,6 @@
 #include "liquid_glass/window.h"
 #include "edge_reveal.h"
+#include "capture_mapping.h"
 
 #include <d2d1_3.h>
 #include <d3d11.h>
@@ -124,7 +125,8 @@ float4 PS(VOut input) : SV_TARGET {
     float2 flow = length(velocity) > .1 ? normalize(velocity) : float2(0,0);
     float leading = dot(normal, flow);
     float thickness = 1.0 + leading * speed * .32;
-    float2 rawUv = diagnostic > .5 ? input.uv : (desktopOrigin + input.uv * size) / desktopSize;
+    float2 captureScale = max(revealSpan.zw, float2(.001,.001));
+    float2 rawUv = diagnostic > .5 ? input.uv : (desktopOrigin + input.uv * size * captureScale) / desktopSize;
     float refractBand = 1.0 - sqrt(max(0.0, 1.0 - edge * edge));
     float2 displacement = normal * thickness * refractBand * refraction * .28 / desktopSize;
     float2 refractedUv = rawUv + displacement;
@@ -228,6 +230,8 @@ struct Window::Impl {
     UINT blurHeight = 0;
     LONG backdropLeft = 0;
     LONG backdropTop = 0;
+    float backdropScaleX = 1.f;
+    float backdropScaleY = 1.f;
     ID3D11SamplerState* sampler = nullptr;
     DXGI_OUTPUT_DESC outputDesc{};
     ID2D1Factory1* d2dFactory = nullptr;
@@ -266,6 +270,9 @@ struct Window::Impl {
     float collapseProgress = 0;
     std::optional<float> edgeAnchor;
     float revealProgress = 0;
+    float revealStart = 0;
+    float revealElapsedMs = 0;
+    bool revealAnimating = false;
     bool collapsed = false;
     Edge edgeSide = Edge::Right;
     bool freeCollapsed = false;
@@ -436,6 +443,7 @@ void Window::Impl::ensureDuplication()
     if (duplication && outputDesc.Monitor == monitor)
         return;
     release(duplication);
+    outputDesc = {};
     IDXGIDevice* dxgiDevice = nullptr;
     IDXGIAdapter* adapter = nullptr;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) || FAILED(dxgiDevice->GetAdapter(&adapter))) {
@@ -522,12 +530,14 @@ void Window::Impl::captureBackdrop()
         D3D11_TEXTURE2D_DESC desc{}; frame->GetDesc(&desc);
         RECT window{}; GetWindowRect(hwnd, &window);
         constexpr LONG kCapturePad = 120;
-        const LONG outputWidth = desc.Width;
-        const LONG outputHeight = desc.Height;
-        LONG sourceLeft = std::clamp<LONG>(window.left - outputDesc.DesktopCoordinates.left - kCapturePad, 0, outputWidth - 1);
-        LONG sourceTop = std::clamp<LONG>(window.top - outputDesc.DesktopCoordinates.top - kCapturePad, 0, outputHeight - 1);
-        const LONG sourceRight = std::clamp<LONG>(window.right - outputDesc.DesktopCoordinates.left + kCapturePad, sourceLeft + 1, outputWidth);
-        const LONG sourceBottom = std::clamp<LONG>(window.bottom - outputDesc.DesktopCoordinates.top + kCapturePad, sourceTop + 1, outputHeight);
+        const CaptureMapping mapping = captureMapping(outputDesc.DesktopCoordinates,
+            static_cast<LONG>(desc.Width), static_cast<LONG>(desc.Height), window, kCapturePad);
+        LONG sourceLeft = mapping.source.left;
+        LONG sourceTop = mapping.source.top;
+        LONG sourceRight = mapping.source.right;
+        LONG sourceBottom = mapping.source.bottom;
+        const float scaleX = mapping.scaleX;
+        const float scaleY = mapping.scaleY;
         const UINT cropWidth = static_cast<UINT>(sourceRight - sourceLeft);
         const UINT cropHeight = static_cast<UINT>(sourceBottom - sourceTop);
         if (!backdropDirty && backdrop && !captureVisible && captureNow-lastBackdropCopy<250) {
@@ -566,6 +576,8 @@ void Window::Impl::captureBackdrop()
             context->CopySubresourceRegion(backdrop, 0, 0, 0, 0, frame, 0, &crop);
             backdropLeft = sourceLeft;
             backdropTop = sourceTop;
+            backdropScaleX = scaleX;
+            backdropScaleY = scaleY;
             backdropIsDiagnostic = false;
             const UINT sx=cropWidth/2, sy=cropHeight/2;
             D3D11_TEXTURE2D_DESC staging=desc;
@@ -657,8 +669,9 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     struct Frame { float v[36]; } frame{{
         static_cast<float>(width), static_cast<float>(height), static_cast<float>(model.radius), model.glass / 100.0f,
         static_cast<float>(model.style==1?100:model.blur), static_cast<float>(model.style==1?model.refraction*.15f:model.refraction), static_cast<float>(now % 100000) / 1000.0f, model.animations?1.0f:0.0f,
-        desktopW, desktopH, static_cast<float>(desktop.left - outputDesc.DesktopCoordinates.left - backdropLeft),
-        static_cast<float>(desktop.top - outputDesc.DesktopCoordinates.top - backdropTop),
+        desktopW, desktopH,
+        static_cast<float>(desktop.left - outputDesc.DesktopCoordinates.left) * backdropScaleX - backdropLeft,
+        static_cast<float>(desktop.top - outputDesc.DesktopCoordinates.top) * backdropScaleY - backdropTop,
         velocityX + edgeVelocityX, velocityY + edgeVelocityY, edgePulse, (fixedBackdrop || model.debugPattern || forceDiagnosticPattern) ? 1.0f : 0.0f,
         model.dispersion / 100.0f, model.rimLight / 100.0f, model.surfaceMotion / 100.0f, 0,
         localCursorX, localCursorY, model.animations ? model.surfaceMotion / 100.0f : 0, pressResponse,
@@ -684,6 +697,8 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     frame.v[32]=shape.radius;
     frame.v[33]=shape.curve;
     frame.v[34]=revealProgress;
+    frame.v[36]=backdropScaleX;
+    frame.v[37]=backdropScaleY;
     if (SUCCEEDED(context->Map(frameBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         std::memcpy(mapped.pData, &frame, sizeof(frame));
         context->Unmap(frameBuffer, 0);
@@ -728,11 +743,18 @@ void Window::Impl::draw()
     const float dt=lastDrawTick ? std::min(64.f,static_cast<float>(tick-lastDrawTick)) : 16.f;
     lastDrawTick=tick;
     pressResponse += ((pressed?1.f:0.f)-pressResponse)*(1-std::exp(-dt/90.f));
-    const float goal=collapsed?1.f:0.f;
-    const float morphStep=model.animations?1-std::exp(-dt/180.f):1.f;
-    revealProgress += (goal-revealProgress)*morphStep;
-    if(std::abs(goal-revealProgress)<.001f) revealProgress=goal;
-    collapseProgress=revealProgress;
+    const float goal = collapsed ? 1.f : 0.f;
+    if (!model.animations) {
+        revealProgress = goal;
+        revealAnimating = false;
+    } else if (revealAnimating) {
+        revealElapsedMs = std::min(revealElapsedMs + dt, static_cast<float>(model.animationDurationMs));
+        const float linear = revealElapsedMs / std::max(1, model.animationDurationMs);
+        const float eased = animationEase(linear, model.animationCurve);
+        revealProgress = std::lerp(revealStart, goal, eased);
+        if (linear >= 1.f) revealAnimating = false;
+    }
+    collapseProgress = revealProgress;
     RECT desktop{}; GetWindowRect(hwnd, &desktop);
     captureBackdrop();
     if(measure) QueryPerformanceCounter(&captured);
@@ -776,10 +798,12 @@ void Window::Impl::draw()
             sink->AddLine({tl.x,tl.y+r});
             sink->AddBezier(D2D1_BEZIER_SEGMENT{{tl.x,tl.y+r-k*r},{tl.x+r-k*r,tl.y},{tl.x+r,tl.y}});
             sink->EndFigure(D2D1_FIGURE_END_CLOSED); sink->Close();
-            d2d->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(),geometry,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::Matrix3x2F::Identity(),1.f),nullptr);
-            if(owner->paintContent) owner->paintContent({d2d,width,height,backdropLuma});
+            const float contentOpacity = 1.f - animationEase(revealProgress, model.animationCurve);
+            d2d->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(),geometry,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::Matrix3x2F::Identity(),contentOpacity),nullptr);
+            if (owner->paintContent && contentOpacity > .001f)
+                owner->paintContent({d2d,width,height,backdropLuma});
             d2d->PopLayer();
-        } else if(owner->paintContent) owner->paintContent({d2d,width,height,backdropLuma});
+        }
         release(sink); release(geometry);
         error = d2d->EndDraw();
         if (FAILED(error)) return;
@@ -833,6 +857,15 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
             impl->ensureDuplication();
             impl->draw();
         }
+        return 0;
+    case WM_DISPLAYCHANGE:
+        release(impl->duplication);
+        impl->outputDesc = {};
+        impl->backdropDirty = true;
+        impl->blurDirty = true;
+        impl->lastBackdropCapture = 0;
+        impl->lastBackdropCopy = 0;
+        impl->draw();
         return 0;
     case WM_PAINT: { PAINTSTRUCT paint{}; BeginPaint(hwnd, &paint); impl->draw(); EndPaint(hwnd, &paint); return 0; }
     case WM_NCHITTEST:
@@ -893,14 +926,14 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
             GetCursorPos(&cursor);
             GetWindowRect(hwnd, &bounds);
             if (impl->collapsed) {
-                if (!impl->owner->hitTestCollapsedCapsule({cursor.x, cursor.y}) && !PtInRect(&bounds, cursor)) {
+                if (!impl->owner->hitTestCollapsedCapsule({cursor.x, cursor.y})) {
                     impl->wakeOnEntry = true;
                 } else if (impl->wakeOnEntry) {
                     impl->wakeOnEntry = false;
                     if (impl->freeCollapsed)
                         impl->owner->setFreeCollapsed(false);
-                    else if (impl->owner->edgeCollapsedChanged)
-                        impl->owner->edgeCollapsedChanged(false);
+                    else
+                        impl->owner->setCollapsed(false);
                 }
             } else if (impl->pressed || impl->dragging || PtInRect(&bounds, cursor)) {
                 impl->pointerOutsideSince = 0;
@@ -972,12 +1005,25 @@ Image Window::Impl::capsuleSnapshot() const
     if (!collapsed) return {};
     const Image panel = snapshot();
     if (panel.empty()) return {};
-    const bool vertical=edgeSide==Edge::Left||edgeSide==Edge::Right;
+    const bool vertical = edgeSide == Edge::Left || edgeSide == Edge::Right;
+    if (freeCollapsed) {
+        const int diameter = static_cast<int>(std::ceil(std::min({
+            capsuleRadius(edgeSide, model.scale, static_cast<float>(panel.width), static_cast<float>(panel.height)) * 2.f,
+            static_cast<float>(panel.width - 2), static_cast<float>(panel.height - 2)})));
+        Image result; result.width = std::min(panel.width, diameter); result.height = std::min(panel.height, diameter);
+        const int x = (panel.width - result.width) / 2;
+        const int y = (panel.height - result.height) / 2;
+        result.pixels.resize(result.width * result.height * 4);
+        for (int row = 0; row < result.height; ++row)
+            std::memcpy(result.pixels.data() + row * result.width * 4,
+                        panel.pixels.data() + ((y + row) * panel.width + x) * 4, result.width * 4);
+        return result;
+    }
     const int radius = static_cast<int>(std::ceil(capsuleRadius(edgeSide, model.scale, static_cast<float>(panel.width), static_cast<float>(panel.height))));
-    const int longSide = radius*2;
-    Image result; result.width=std::min(panel.width,vertical?radius:longSide); result.height=std::min(panel.height,vertical?longSide:radius);
-    const int x=vertical?(edgeSide==Edge::Right?panel.width-result.width:0):(panel.width-result.width)/2;
-    const int y=vertical?(panel.height-result.height)/2:(edgeSide==Edge::Bottom?panel.height-result.height:0);
+    const int longSide = radius * 2;
+    Image result; result.width = std::min(panel.width, vertical ? radius : longSide); result.height = std::min(panel.height, vertical ? longSide : radius);
+    const int x = vertical ? (edgeSide == Edge::Right ? panel.width - result.width : 0) : (panel.width - result.width) / 2;
+    const int y = vertical ? (panel.height - result.height) / 2 : (edgeSide == Edge::Bottom ? panel.height - result.height : 0);
     result.pixels.resize(result.width*result.height*4);
     for(int row=0;row<result.height;++row) std::memcpy(result.pixels.data()+row*result.width*4,panel.pixels.data()+((y+row)*panel.width+x)*4,result.width*4);
     return result;
@@ -1077,11 +1123,22 @@ void Window::setMaterial(Material model){
 }
 void Window::setEdgeCollapsed(bool collapsed,Edge side,std::optional<int> anchor,int workAreaFirst,int workAreaLast){
     RECT rect{}; if(m->hwnd) GetWindowRect(m->hwnd,&rect);
-    const bool wasCollapsed=m->collapsed;
+    const bool wasCollapsed = m->collapsed;
+    const Edge previousEdge = m->edgeSide;
+    const bool edgeChanged = wasCollapsed && collapsed && !m->freeCollapsed && previousEdge != side;
+    if (wasCollapsed != collapsed) {
+        m->revealStart = m->revealProgress;
+        m->revealElapsedMs = 0;
+        m->revealAnimating = m->model.animations;
+        if (!m->model.animations) m->revealProgress = collapsed ? 1.f : 0.f;
+    }
     m->collapsed=collapsed;m->freeCollapsed=false;m->edgeSide=side;
     m->workAreaFirst=workAreaFirst;m->workAreaLast=workAreaLast;
-    if(anchor) m->edgeAnchor=static_cast<float>(*anchor);
-    else if(!wasCollapsed&&collapsed) m->edgeAnchor=verticalEdge(side)?(rect.top+rect.bottom)*.5f:(rect.left+rect.right)*.5f;
+    if (anchor) m->edgeAnchor = static_cast<float>(*anchor);
+    else if (!wasCollapsed && collapsed) m->edgeAnchor = verticalEdge(side)
+        ? (rect.top + rect.bottom) * .5f : (rect.left + rect.right) * .5f;
+    else if (edgeChanged) m->edgeAnchor = verticalEdge(side)
+        ? (rect.top + rect.bottom) * .5f : (rect.left + rect.right) * .5f;
     m->pointerOutsideSince = 0;
     POINT cursor{};
     GetCursorPos(&cursor);
@@ -1090,6 +1147,10 @@ void Window::setEdgeCollapsed(bool collapsed,Edge side,std::optional<int> anchor
 }
 void Window::setFreeCollapsed(bool collapsed){
     if (!m->hwnd || (m->collapsed && !m->freeCollapsed) || m->freeCollapsed == collapsed) return;
+    m->revealStart = m->revealProgress;
+    m->revealElapsedMs = 0;
+    m->revealAnimating = m->model.animations;
+    if (!m->model.animations) m->revealProgress = collapsed ? 1.f : 0.f;
     m->freeCollapsed = collapsed;
     m->collapsed = collapsed;
     m->edgeSide = Edge::Center;
@@ -1100,11 +1161,20 @@ void Window::setFreeCollapsed(bool collapsed){
     render();
 }
 void Window::setCollapsed(bool collapsed){
-    if (!m->hwnd || m->collapsed == collapsed) return;
+    if (!m->hwnd) return;
+    if (m->collapsed == collapsed && !m->freeCollapsed) return;
+    m->revealStart = m->revealProgress;
+    m->revealElapsedMs = 0;
+    m->revealAnimating = m->model.animations;
+    if (!m->model.animations) m->revealProgress = collapsed ? 1.f : 0.f;
+    const bool wasFreeCollapsed = m->freeCollapsed;
     m->freeCollapsed = false;
     m->collapsed = collapsed;
-    m->edgeSide = Edge::Center;
-    m->edgeAnchor.reset();
+    if (wasFreeCollapsed) {
+        RECT rect{}; GetWindowRect(m->hwnd, &rect);
+        m->edgeSide = Edge::Center;
+        m->edgeAnchor = (rect.left + rect.right) * .5f;
+    }
     m->pointerOutsideSince = 0;
     m->wakeOnEntry = true;
     m->updateInputStyle();
@@ -1117,9 +1187,15 @@ bool Window::hitTestCollapsedCapsule(Point point) const
     if(!m || !m->hwnd || !m->collapsed) return false;
     RECT rect{}; GetWindowRect(m->hwnd,&rect);
     const float width=static_cast<float>(rect.right-rect.left),height=static_cast<float>(rect.bottom-rect.top);
-    const float radius=capsuleRadius(m->edgeSide,m->model.scale,width,height);
+    const float radius = capsuleRadius(m->edgeSide, m->model.scale, width, height);
+    if (m->freeCollapsed) {
+        const float diameter = std::min({radius * 2.f, width - 2.f, height - 2.f});
+        const float dx = static_cast<float>(point.x) - (rect.left + rect.right) * .5f;
+        const float dy = static_cast<float>(point.y) - (rect.top + rect.bottom) * .5f;
+        return dx * dx + dy * dy <= diameter * diameter * .25f;
+    }
     const float along=m->localAnchor(rect);
-    const Edge shapeEdge=m->freeCollapsed?Edge::Center:m->edgeSide;
+    const Edge shapeEdge=m->edgeSide;
     const float shapeAlong=m->freeCollapsed?(verticalEdge(m->edgeSide)?height:width)*.5f:along;
     const bool hasWorkArea=m->workAreaFirst!=0||m->workAreaLast!=0;
     const float workOrigin=verticalEdge(m->edgeSide)?static_cast<float>(rect.top):static_cast<float>(rect.left);

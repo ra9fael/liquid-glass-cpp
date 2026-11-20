@@ -1,5 +1,6 @@
 #include <liquid_glass/window.h>
 #include "../src/edge_reveal.h"
+#include "../src/capture_mapping.h"
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -146,19 +147,25 @@ void cornerAnimationProbe()
                 window.render();
                 const auto image = window.snapshot();
                 require(image.width == width && image.height == height, "corner frame readback size");
-                int firstVisible = width, lastVisible = -1, mismatch = 0;
+                int firstVisible = width, lastVisible = -1;
+                int contentLeft = width, contentRight = -1, mismatch = 0;
                 for (int y = 0; y < height; ++y) {
                     for (int x = 0; x < width; ++x) {
                         const int alpha = channel(image, x, y, 3);
                         const int red = channel(image, x, y, 2);
                         if (x < firstLimit || x >= lastLimit) maxOutside = std::max(maxOutside, alpha);
-                        if (alpha < 128) continue;
-                        firstVisible = std::min(firstVisible, x);
-                        lastVisible = std::max(lastVisible, x);
-                        // Red is the content mask. Disregard pixels in its antialiasing band.
-                        mismatch += (alpha > 230 && red < 32) || (red > 230 && alpha < 250);
+                        if (alpha >= 128) {
+                            firstVisible = std::min(firstVisible, x);
+                            lastVisible = std::max(lastVisible, x);
+                        }
+                        if (red > 128) {
+                            contentLeft = std::min(contentLeft, x);
+                            contentRight = std::max(contentRight, x);
+                        }
                     }
                 }
+                if (contentRight >= contentLeft && lastVisible >= firstVisible)
+                    mismatch = std::max(std::abs(contentLeft - firstVisible), std::abs(contentRight - lastVisible));
                 maxMismatch = std::max(maxMismatch, mismatch);
                 const int blocked = left ? firstVisible : lastVisible;
                 const int growingSide = left ? lastVisible : width - 1 - firstVisible;
@@ -247,6 +254,14 @@ int main(int argc,char** argv){
             require(collapsed.first==19&&collapsed.last==71,"collapse returns to the saved pointer anchor");
             require(liquid_glass::capsuleHit(100,100,100,100,26),"pointer anchor hits capsule");
             require(!liquid_glass::capsuleHit(100,127,100,100,26),"pointer outside capsule does not hit");
+            const auto circle = liquid_glass::panelShape(80, 28, liquid_glass::Edge::Center, 14, 26, 20, 0, 0, 0);
+            require(circle.right - circle.left <= 26 && circle.bottom - circle.top <= 26 &&
+                    std::abs((circle.right - circle.left) - (circle.bottom - circle.top)) < .01f,
+                    "free-hide capsule is a complete circle constrained by the short panel side");
+            require(std::abs(liquid_glass::animationEase(.5f, 0) - .5f) < .001f &&
+                    liquid_glass::animationEase(.5f, 1) > .5f &&
+                    liquid_glass::animationEase(.5f, 3) < .5f,
+                    "animation curves provide linear, ease-out and ease-in progress");
             const auto topCorner=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,.5f,0,300);
             const auto topRest=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,0,0,300);
             const auto topFull=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,1,0,300);
@@ -254,7 +269,19 @@ int main(int argc,char** argv){
             require(topCorner.curve>2&&topRest.curve==2&&topFull.curve==2,"liquid contour curves through the reveal and settles at both ends");
             const auto bottomCorner=liquid_glass::panelShape(300,180,liquid_glass::Edge::Bottom,274,26,20,.5f,0,300);
             require(bottomCorner.right==299&&bottomCorner.left>topCorner.left,"bottom-edge corner clips independently at the right boundary");
+            const RECT desktop{0, 0, 2560, 1440};
+            const RECT window{600, 500, 900, 700};
+            const auto native = liquid_glass::captureMapping(desktop, 2560, 1440, window, 120);
+            const auto scaled = liquid_glass::captureMapping(desktop, 1280, 720, window, 120);
+            require(native.source.top < native.source.bottom && native.source.bottom <= 820,
+                    "capture mapping preserves the lower window region");
+            require(std::abs(scaled.scaleX - .5f) < .001f && std::abs(scaled.scaleY - .5f) < .001f,
+                    "remote-session texture scales against desktop coordinates");
+            require(std::abs(scaled.source.top * 2 - native.source.top) <= 2 &&
+                    std::abs(scaled.source.bottom * 2 - native.source.bottom) <= 2,
+                    "scaled capture crop tracks both upper and lower regions");
             std::cout<<"edge_reveal_geometry: all checks passed\n";
+            std::cout<<"capture_mapping: native and half-resolution upper/lower crops passed\n";
             return 0;
         }
         const auto centered=liquid_glass::revealSpan(160,26,80,1);

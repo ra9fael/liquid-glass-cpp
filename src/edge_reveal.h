@@ -41,6 +41,15 @@ struct PanelShape {
     float left, top, right, bottom, radius, curve;
 };
 
+inline float animationEase(float value, int curve)
+{
+    const float t = std::clamp(value, 0.f, 1.f);
+    if (curve == 0) return t;
+    if (curve == 2) return t * t * (3.f - 2.f * t);
+    if (curve == 3) return t * t * t;
+    return 1.f - (1.f - t) * (1.f - t);
+}
+
 inline PanelShape panelShape(float width, float height, Edge edge, float anchor,
                              float radius, float panelRadius, float progress,
                              float workFirst, float workLast)
@@ -48,11 +57,11 @@ inline PanelShape panelShape(float width, float height, Edge edge, float anchor,
     const bool vertical = edge == Edge::Left || edge == Edge::Right;
     const float depth = vertical ? width : height;
     if (edge == Edge::Center) {
-        const float halfWidth = std::lerp(radius, width * .5f - 1, progress);
-        const float halfHeight = std::lerp(radius, height * .5f - 1, progress);
-        return {width * .5f - halfWidth, height * .5f - halfHeight,
-                width * .5f + halfWidth, height * .5f + halfHeight,
-                std::min({std::lerp(radius, panelRadius, progress), halfWidth, halfHeight}),
+        const float diameter = std::max(2.f, std::min({radius * 2.f, width - 2.f, height - 2.f}));
+        const float half = std::lerp(diameter * .5f, std::min(width, height) * .5f - 1.f, progress);
+        return {width * .5f - half, height * .5f - half,
+                width * .5f + half, height * .5f + half,
+                std::min({std::lerp(diameter * .5f, panelRadius, progress), half, panelRadius}),
                 2.f+0.6f*std::sin(3.14159265f*progress)};
     }
     const float length = vertical ? height : width;

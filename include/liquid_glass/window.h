@@ -34,6 +34,8 @@ struct Material {
     bool freeHideEnabled = false;
     bool debugPattern = false;
     bool animations = true;
+    int animationCurve = 1;
+    int animationDurationMs = 400;
     int radius = 22;
     int blur = 34;
     int glass = 72;
