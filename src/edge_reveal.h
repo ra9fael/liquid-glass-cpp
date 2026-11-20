@@ -47,6 +47,13 @@ inline float animationEase(float value, int curve)
     if (curve == 0) return t;
     if (curve == 2) return t * t * (3.f - 2.f * t);
     if (curve == 3) return t * t * t;
+    if (curve == 5) return .5f - .5f * std::cos(3.14159265358979323846f * t);
+    if (curve == 6) return 1.f - (1.f + 3.f * t) * std::pow(1.f - t, 3.f);
+    if (curve == 7) {
+        constexpr float damping = 7.f;
+        return std::clamp(1.f - std::exp(-damping * t) *
+            (std::cos(10.f * t) + damping / 10.f * std::sin(10.f * t)), 0.f, 1.f);
+    }
     if (curve == 4) {
         constexpr float overshoot = 1.2f;
         const float shifted = t - 1.f;

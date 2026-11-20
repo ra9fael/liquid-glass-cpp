@@ -315,8 +315,13 @@ int main(int argc,char** argv){
                     liquid_glass::animationEase(.5f, 1) > .5f &&
                     liquid_glass::animationEase(.5f, 3) < .5f &&
                     liquid_glass::animationEase(.8f, 4) > 1.f &&
-                    std::abs(liquid_glass::animationEase(1.f, 4) - 1.f) < .001f,
-                    "animation curves include bounded-endpoint overshoot");
+                    std::abs(liquid_glass::animationEase(1.f, 4) - 1.f) < .001f &&
+                    std::abs(liquid_glass::animationEase(.5f, 5) - .5f) < .001f &&
+                    liquid_glass::animationEase(.8f, 6) > .95f &&
+                    liquid_glass::animationEase(.1f, 7) > .05f &&
+                    liquid_glass::animationEase(.1f, 7) < .95f &&
+                    std::abs(liquid_glass::animationEase(1.f, 7) - 1.f) < .001f,
+                    "animation curves include sine, fast-out, and spring easing");
             const auto topCorner=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,.5f,0,300);
             const auto topRest=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,0,0,300);
             const auto topFull=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,1,0,300);
