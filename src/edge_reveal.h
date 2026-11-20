@@ -86,9 +86,14 @@ inline PanelShape panelShape(float width, float height, Edge edge, float anchor,
     const float length = vertical ? height : width;
     const float firstLimit = std::max(1.f, workFirst + 1.f);
     const float lastLimit = std::min(length - 1, workLast - 1.f);
-    const float reach = std::lerp(radius, std::max({radius, anchor - firstLimit, lastLimit - anchor}), progress);
-    const float first = std::max(firstLimit, anchor - reach);
-    const float last = std::min(lastLimit, anchor + reach);
+    const float available = std::max(0.f, lastLimit - firstLimit);
+    const float capsuleRadius = std::min(radius, available * .5f);
+    const float capsuleAnchor = std::clamp(anchor, firstLimit + capsuleRadius, lastLimit - capsuleRadius);
+    const float reach = std::lerp(capsuleRadius,
+                                  std::max({capsuleRadius, capsuleAnchor - firstLimit, lastLimit - capsuleAnchor}),
+                                  progress);
+    const float first = std::max(firstLimit, capsuleAnchor - reach);
+    const float last = std::min(lastLimit, capsuleAnchor + reach);
     const bool startEdge = edge == Edge::Left || edge == Edge::Top;
     const float normalNear = std::lerp(-radius, 1.f, progress);
     const float normalFar = std::lerp(radius, depth - 1, progress);

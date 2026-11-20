@@ -329,6 +329,14 @@ int main(int argc,char** argv){
             require(topCorner.curve>2&&topRest.curve==2&&topFull.curve==2,"liquid contour curves through the reveal and settles at both ends");
             const auto bottomCorner=liquid_glass::panelShape(300,180,liquid_glass::Edge::Bottom,274,26,20,.5f,0,300);
             require(bottomCorner.right==299&&bottomCorner.left>topCorner.left,"bottom-edge corner clips independently at the right boundary");
+            const auto topAtLeft=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,0,26,20,0,0,300);
+            const auto topAtRight=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,300,26,20,0,0,300);
+            const auto bottomAtLeft=liquid_glass::panelShape(300,180,liquid_glass::Edge::Bottom,0,26,20,0,0,300);
+            const auto bottomAtRight=liquid_glass::panelShape(300,180,liquid_glass::Edge::Bottom,300,26,20,0,0,300);
+            require(topAtLeft.right-topAtLeft.left==52&&topAtRight.right-topAtRight.left==52&&
+                    bottomAtLeft.right-bottomAtLeft.left==52&&bottomAtRight.right-bottomAtRight.left==52&&
+                    topAtLeft.radius==26&&topAtRight.radius==26&&bottomAtLeft.radius==26&&bottomAtRight.radius==26,
+                    "top and bottom edge capsules retain their full radius at both horizontal screen edges");
             const RECT desktop{0, 0, 2560, 1440};
             const RECT window{600, 500, 900, 700};
             const auto native = liquid_glass::captureMapping(desktop, 2560, 1440, window, 120);

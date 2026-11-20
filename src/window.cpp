@@ -705,7 +705,7 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
         static_cast<float>(desktop.top - outputDesc.DesktopCoordinates.top) * backdropScaleY - backdropTop,
         velocityX + edgeVelocityX, velocityY + edgeVelocityY, edgePulse, (fixedBackdrop || model.debugPattern || forceDiagnosticPattern) ? 1.0f : 0.0f,
         model.dispersion / 100.0f, model.rimLight / 100.0f, model.surfaceMotion / 100.0f, 0,
-        localCursorX, localCursorY, model.animations && !dragging ? model.surfaceMotion / 100.0f : 0, pressResponse,
+        localCursorX, localCursorY, model.animations ? model.surfaceMotion / 100.0f : 0, pressResponse,
         0, 0, 0, 0,
         static_cast<float>(model.style), model.tileSize*model.scale, model.dark?1.f:0.f, 0,
         0, 0, 0, 0,
