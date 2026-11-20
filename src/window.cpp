@@ -130,16 +130,17 @@ float4 PS(VOut input) : SV_TARGET {
     float2 captureScale = max(revealAndCaptureScale.zw, float2(.001,.001));
     float2 rawUv = diagnostic > .5 ? input.uv : (desktopOrigin + input.uv * size * captureScale) / desktopSize;
     float refractBand = 1.0 - sqrt(max(0.0, 1.0 - edge * edge));
-    float2 displacement = normal * thickness * refractBand * refraction * .28 / desktopSize;
+    float interior = saturate(edge * 2.0);
+    float2 displacement = normal * thickness * refractBand * refraction * .10 / desktopSize;
     float2 refractedUv = rawUv + displacement;
-    refractedUv += flow * refractBand * speed * 3.5 / desktopSize;
+    refractedUv += flow * refractBand * speed * 1.5 / desktopSize;
     float cursorDistance = length(p - cursor);
     float cursorLens = exp(-cursorDistance * cursorDistance / max(800.0, min(size.x,size.y) * min(size.x,size.y) * .10));
-    refractedUv += (p-cursor) * cursorLens * cursorGlow * (.12 + cursorAndLighting.w*.18) / desktopSize;
-    refractedUv += flow * speed * sin(time*8-length(p)*.035) * 7 / desktopSize;
+    refractedUv += (p-cursor) * cursorLens * cursorGlow * (.12 + cursorAndLighting.w*.18) * interior / desktopSize;
+    refractedUv += flow * speed * sin(time*8-length(p)*.035) * 3 / desktopSize;
     float2 tile = frac(input.uv*size/max(materialStyle.y,8))-.5;
-    if(materialStyle.x>1.5) refractedUv += sin(tile*6.283185)*refraction*.12/desktopSize;
-    float2 spectrum = displacement * dispersion * (p.x*p.y/max(size.x*size.y*.25,1.0));
+    if(materialStyle.x>1.5) refractedUv += sin(tile*6.283185)*refraction*.06*interior/desktopSize;
+    float2 spectrum = displacement * dispersion * .2 * (p.x*p.y/max(size.x*size.y*.25,1.0));
     float3 red = sampleContent(refractedUv+spectrum);
     float3 orange = sampleContent(refractedUv+spectrum*(2.0/3.0));
     float3 yellow = sampleContent(refractedUv+spectrum/3.0);
@@ -680,7 +681,7 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
         0, 0, 0, 0,
         static_cast<float>(model.style), model.tileSize*model.scale, model.dark?1.f:0.f, 0,
         0, 0, 0, 0,
-        revealProgress, backdropScaleX, backdropScaleY, 0,
+        revealProgress, 0, backdropScaleX, backdropScaleY,
         dragging ? 0.f : 1.f, 0, 0, 0}};
     D3D11_MAPPED_SUBRESOURCE mapped{};
     RECT windowRect{}; GetWindowRect(hwnd, &windowRect);
@@ -702,8 +703,6 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     frame.v[33]=shape.curve;
     frame.v[34]=revealProgress;
     frame.v[35]=1.f;
-    frame.v[36]=backdropScaleX;
-    frame.v[37]=backdropScaleY;
     if (SUCCEEDED(context->Map(frameBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         std::memcpy(mapped.pData, &frame, sizeof(frame));
         context->Unmap(frameBuffer, 0);
@@ -948,14 +947,14 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
                 const auto now = GetTickCount64();
                 if (!impl->pointerOutsideSince) impl->pointerOutsideSince = now;
                 const auto elapsed = now - impl->pointerOutsideSince;
-                const bool freeDue = !impl->model.edgeHide && impl->model.freeHideEnabled &&
-                    impl->model.freeHideDelayMs > 0 && elapsed >= static_cast<ULONGLONG>(impl->model.freeHideDelayMs);
+                const bool freeDue = impl->model.freeHideEnabled && impl->model.freeHideDelayMs > 0 &&
+                    elapsed >= static_cast<ULONGLONG>(impl->model.freeHideDelayMs);
                 const bool edgeDue = impl->model.edgeHide && elapsed >= 700;
                 const bool didEdgeCollapse = edgeDue && impl->owner->edgeCollapsedChanged &&
                     impl->owner->edgeCollapsedChanged(true);
                 if (didEdgeCollapse) {
                     impl->pointerOutsideSince = 0;
-                } else if (freeDue && !impl->model.edgeHide) {
+                } else if (freeDue) {
                     impl->owner->setFreeCollapsed(true);
                     impl->pointerOutsideSince = 0;
                 }

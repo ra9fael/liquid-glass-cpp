@@ -206,8 +206,8 @@ int main(int argc,char** argv){
         if(argc>1 && std::string(argv[1])=="--probe-free-hide") {
             liquid_glass::Window probe;
             require(probe.create(),"create free-hide window");
-            liquid_glass::Material material; material.animations=true; material.edgeHide=false;
-            material.freeHideEnabled=true; material.freeHideDelayMs=500;
+            liquid_glass::Material material; material.animations=true; material.edgeHide=true;
+            material.freeHideEnabled=true; material.freeHideDelayMs=1400;
             material.blur=0;material.refraction=0;material.dispersion=0;material.rimLight=0;material.surfaceMotion=0;
             probe.setMaterial(material);
             liquid_glass::Image backdrop;backdrop.width=240;backdrop.height=160;backdrop.pixels.resize(240*160*4,255);
@@ -219,15 +219,19 @@ int main(int argc,char** argv){
             while(GetTickCount64()-started<350)tick();
             auto image=probe.snapshot();
             require(channel(image,120,80,3)==255,"free panel remains expanded before delay");
-            Sleep(220);
+            Sleep(850);
             for(int i=0;i<12;++i)tick();
             image=probe.snapshot();
             const auto visiblePixels=[](const liquid_glass::Image& frame){int count=0;for(int y=0;y<frame.height;++y)for(int x=0;x<frame.width;++x)count+=channel(frame,x,y,3)>0;return count;};
+            require(channel(image,120,80,3)==255,"both hide modes leave an unsnapped panel expanded before the free-hide delay");
+            Sleep(650);
+            for(int i=0;i<12;++i)tick();
+            image=probe.snapshot();
             const int midpoint=visiblePixels(image);
-            require(midpoint>0&&midpoint<240*160,"free hide uses an animated intermediate shape");
+            require(midpoint>0&&midpoint<240*160,"free hide uses an animated intermediate shape when edge and free hide are both enabled");
             for(int i=0;i<60;++i)tick();
             image=probe.snapshot();
-            require(visiblePixels(image)<240*160/2,"free hide reaches its centered trigger shape");
+            require(visiblePixels(image)<240*160/2,"free hide reaches its centered trigger shape when edge and free hide are both enabled");
             SetCursorPos(320,260);
             for(int i=0;i<15;++i)tick();
             image=probe.snapshot();
@@ -235,7 +239,7 @@ int main(int argc,char** argv){
             require(wakeMidpoint>0&&wakeMidpoint<240*160,"free wake uses an animated intermediate shape");
             for(int i=0;i<60;++i)tick();
             image=probe.snapshot();
-            require(channel(image,120,80,3)==255,"hovering trigger restores the full panel");
+            require(channel(image,120,80,3)==255,"hovering trigger restores the full panel when both hide modes are enabled");
             SetCursorPos(cursor.x,cursor.y);probe.hide();
             std::cout<<"free_hide_window: delay, animated collapse, wake and animated reveal passed\\n";
             return 0;
