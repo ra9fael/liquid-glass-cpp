@@ -241,15 +241,27 @@ int main(int argc,char** argv){
             image=probe.snapshot();
             require(visiblePixels(image)<240*160/2,"free hide reaches its release-point trigger shape when edge and free hide are both enabled");
             RECT currentRect{}; GetWindowRect(probe.hwnd(), &currentRect);
-            require(probe.hitTestCollapsedCapsule({currentRect.left + 30, currentRect.top + 45}),
-                    "free-hide trigger hit test follows the saved release point");
-            require(!probe.hitTestCollapsedCapsule({currentRect.left + 70, currentRect.top + 110}),
+            require(probe.hitTestCollapsedCapsule({currentRect.left + 31, currentRect.top + 46}),
+                    "free-hide trigger hit test follows the visible release-point capsule");
+            require(!probe.hitTestCollapsedCapsule({currentRect.left + 65, currentRect.top + 95}),
                     "hover movement does not shift the free-hide trigger");
-            SetCursorPos(currentRect.left + 30, currentRect.top + 45);
+            SetCursorPos(currentRect.left + 31, currentRect.top + 46);
             for(int i=0;i<15;++i)tick();
             image=probe.snapshot();
             const int wakeMidpoint=visiblePixels(image);
             require(wakeMidpoint>0&&wakeMidpoint<240*160,"free wake uses an animated intermediate shape");
+            const int expectedAnchorX = 30, expectedAnchorY = 45;
+            int minX = image.width, minY = image.height, maxX = -1, maxY = -1;
+            for (int y = 0; y < image.height; ++y) for (int x = 0; x < image.width; ++x) {
+                if (channel(image, x, y, 3) > 0) {
+                    minX = std::min(minX, x); minY = std::min(minY, y);
+                    maxX = std::max(maxX, x); maxY = std::max(maxY, y);
+                }
+            }
+            require(minX < expectedAnchorX && maxX > expectedAnchorX && minY < expectedAnchorY && maxY > expectedAnchorY,
+                    "free wake expands on both axes from the saved drag-release point");
+            require(maxX - minX > 52 && maxY - minY > 52,
+                    "free wake expands on both axes beyond the collapsed capsule");
             for(int i=0;i<60;++i)tick();
             image=probe.snapshot();
             require(channel(image,37,74,3)==255,
@@ -278,13 +290,27 @@ int main(int argc,char** argv){
                     std::abs((circle.bottom - circle.top) - 52.f) < .01f &&
                     std::abs((circle.left + circle.right) * .5f - 30.f) < .01f &&
                     std::abs((circle.top + circle.bottom) * .5f - 45.f) < .01f,
-                    "free-hide trigger is centered on the drag release point");
+                    "free-hide trigger remains fully visible near panel edges");
             require(restored.left == 1 && restored.top == 1 && restored.right == 239 && restored.bottom == 159,
                     "free-hide reveal restores the full panel rectangle");
             const auto centeredCircle = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 120, 26, 20, 0, 0, 0);
             require(std::abs((centeredCircle.left + centeredCircle.right) * .5f - 120.f) < .01f &&
                     std::abs((centeredCircle.top + centeredCircle.bottom) * .5f - 80.f) < .01f,
                     "free-hide trigger defaults to panel center before a release anchor is recorded");
+            const auto lowerAnchor = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 120, 26, 20, .5f, 0, 0, 140);
+            const auto upperAnchor = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 120, 26, 20, .5f, 0, 0, 20);
+            require(lowerAnchor.bottom == 159.f && lowerAnchor.top > 1.f && lowerAnchor.top < 107.f &&
+                    upperAnchor.top == 1.f && upperAnchor.bottom > 53.f && upperAnchor.bottom < 159.f,
+                    "free-hide reveal stops at the nearer vertical edge and keeps growing on the other side");
+            const auto expanding = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 90, 26, 20, .2f, 0, 0, 70);
+            require(expanding.left > 1.f && expanding.right < 239.f && expanding.top > 1.f && expanding.bottom < 159.f &&
+                    std::abs(expanding.left + expanding.right - 180.f) < .01f &&
+                    std::abs(expanding.top + expanding.bottom - 140.f) < .01f &&
+                    expanding.right - expanding.left > 52.f && expanding.bottom - expanding.top > 52.f,
+                    "free-hide reveal grows symmetrically from the release anchor before either side is clipped");
+            const auto bottomCircle = liquid_glass::panelShape(240, 160, liquid_glass::Edge::Center, 120, 26, 20, 0, 0, 0, 158);
+            require(bottomCircle.bottom - bottomCircle.top == 52.f && bottomCircle.bottom == 159.f,
+                    "free-hide circle remains fully inside the panel at a bottom-edge release point");
             require(std::abs(liquid_glass::animationEase(.5f, 0) - .5f) < .001f &&
                     liquid_glass::animationEase(.5f, 1) > .5f &&
                     liquid_glass::animationEase(.5f, 3) < .5f &&

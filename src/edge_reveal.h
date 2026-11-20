@@ -62,16 +62,18 @@ inline PanelShape panelShape(float width, float height, Edge edge, float anchor,
     const bool vertical = edge == Edge::Left || edge == Edge::Right;
     const float depth = vertical ? width : height;
     if (edge == Edge::Center) {
-        const float diameter = std::max(2.f, std::min({radius * 2.f, width - 2.f, height - 2.f}));
-        const float centerX = anchor;
-        const float centerYClamped = centerY < 0.f ? height * .5f : centerY;
-        const float halfWidth = std::lerp(diameter * .5f, width * .5f - 1.f, progress);
-        const float halfHeight = std::lerp(diameter * .5f, height * .5f - 1.f, progress);
-        return {std::lerp(centerX - diameter * .5f, 1.f, progress),
-                std::lerp(centerYClamped - diameter * .5f, 1.f, progress),
-                std::lerp(centerX + diameter * .5f, width - 1.f, progress),
-                std::lerp(centerYClamped + diameter * .5f, height - 1.f, progress),
-                std::min({std::lerp(diameter * .5f, panelRadius, progress), halfWidth, halfHeight}),
+        const float inset = std::min({1.f, width * .5f, height * .5f});
+        const float r = std::min({radius, width * .5f - inset, height * .5f - inset});
+        const float x = std::clamp(anchor, inset + r, width - inset - r);
+        const float y = std::clamp(centerY < 0.f ? height * .5f : centerY, inset + r, height - inset - r);
+        progress = std::clamp(progress, 0.f, 1.f);
+        // Grow by the same reach on both sides until each side meets the panel boundary.
+        const EdgeSpan horizontal = revealSpan(width - 2.f * inset, r, x - inset, progress);
+        const EdgeSpan verticalSpan = revealSpan(height - 2.f * inset, r, y - inset, progress);
+        return {horizontal.first + inset, verticalSpan.first + inset,
+                horizontal.last + inset, verticalSpan.last + inset,
+                std::min({std::lerp(r, panelRadius, progress), (horizontal.last - horizontal.first) * .5f,
+                          (verticalSpan.last - verticalSpan.first) * .5f}),
                 2.f+0.6f*std::sin(3.14159265f*progress)};
     }
     const float length = vertical ? height : width;

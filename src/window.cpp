@@ -117,8 +117,9 @@ float4 PS(VOut input) : SV_TARGET {
         float4 bounds = shapeBounds;
     float2 shapeCenter = (bounds.xy + bounds.zw) * .5;
     float2 shapeHalfSize = (bounds.zw - bounds.xy) * .5;
-    d = revealSpan.y<=2.001 ? sdRoundRect(localPosition-shapeCenter, shapeHalfSize, revealSpan.x)
-        : sdSquircle(localPosition-shapeCenter, shapeHalfSize, revealSpan.x, revealSpan.y);
+    float shapeRadius = min(revealSpan.x, min(shapeHalfSize.x, shapeHalfSize.y));
+    d = revealSpan.y <= 2.001 ? sdRoundRect(localPosition-shapeCenter, shapeHalfSize, shapeRadius)
+        : sdSquircle(localPosition-shapeCenter, shapeHalfSize, shapeRadius, revealSpan.y);
     float coverage = 1.0 - smoothstep(-max(fwidth(d), .75), max(fwidth(d), .75), d);
     float edge = 1.0 - smoothstep(0.0, max(3.0, corner), -d);
     float rim = pow(edge, 2.25);
@@ -286,11 +287,9 @@ struct Window::Impl {
 
     float localAnchor(const RECT& rect) const
     {
-        const float screenAnchor = edgeSide==Edge::Center
-            ? ((rect.top+rect.bottom)*.5f)
-            : edgeAnchor.value_or(verticalEdge(edgeSide)?(rect.top+rect.bottom)*.5f:(rect.left+rect.right)*.5f);
-        return edgeSide==Edge::Center?((rect.bottom-rect.top)*.5f)
-            : screenAnchor-(verticalEdge(edgeSide)?rect.top:rect.left);
+        const bool vertical = verticalEdge(edgeSide);
+        const float screenAnchor = edgeAnchor.value_or(vertical ? (rect.top+rect.bottom)*.5f : (rect.left+rect.right)*.5f);
+        return screenAnchor - (vertical ? rect.top : rect.left);
     }
     float pressResponse = 0;
     bool pressed = false;
@@ -310,7 +309,8 @@ struct Window::Impl {
     void captureBackdrop();
     void ensureBlurTargets(UINT width, UINT height, DXGI_FORMAT format);
     void runBlur();
-    void drawGlass(ID3D11RenderTargetView* destination, UINT width, UINT height, const RECT& desktopRect);
+    PanelShape revealShape(float width, float height, const RECT& rect, float progress) const;
+    void drawGlass(ID3D11RenderTargetView* destination, UINT width, UINT height, const RECT& desktopRect, const PanelShape& shape);
     void draw();
     Image snapshot() const;
     Image backdropSnapshot() const;
@@ -642,7 +642,34 @@ void Window::Impl::resize(UINT width, UINT height)
     release(texture);
 }
 
-void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UINT height, const RECT& desktop)
+PanelShape Window::Impl::revealShape(float width, float height, const RECT& rect, float progress) const
+{
+    const float panelRadius = std::min({static_cast<float>(model.radius), width * .5f, height * .5f});
+    const float radius = capsuleRadius(edgeSide, model.scale, width, height);
+    if (edgeSide == Edge::Center) {
+        const float inset = std::min({1.f, width * .5f, height * .5f});
+        const float r = std::max(0.f, std::min({radius, width * .5f - inset, height * .5f - inset}));
+        const float x = std::clamp(freeAnchor ? static_cast<float>(freeAnchor->x) : width * .5f,
+                                   inset + r, width - inset - r);
+        const float y = std::clamp(freeAnchor ? static_cast<float>(freeAnchor->y) : height * .5f,
+                                   inset + r, height - inset - r);
+        const EdgeSpan horizontal = revealSpan(width - 2.f * inset, r, x - inset, progress);
+        const EdgeSpan verticalSpan = revealSpan(height - 2.f * inset, r, y - inset, progress);
+        return {horizontal.first + inset, verticalSpan.first + inset,
+                horizontal.last + inset, verticalSpan.last + inset,
+                std::min({std::lerp(r, panelRadius, progress), (horizontal.last - horizontal.first) * .5f,
+                          (verticalSpan.last - verticalSpan.first) * .5f}),
+                2.f + .6f * std::sin(3.14159265f * progress)};
+    }
+    const bool vertical = verticalEdge(edgeSide);
+    const float workOrigin = static_cast<float>(vertical ? rect.top : rect.left);
+    const bool hasWorkArea = workAreaFirst != 0 || workAreaLast != 0;
+    return panelShape(width, height, edgeSide, localAnchor(rect), radius, panelRadius, progress,
+                      hasWorkArea ? workAreaFirst - workOrigin : 0.f,
+                      hasWorkArea ? workAreaLast - workOrigin : (vertical ? height : width));
+}
+
+void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UINT height, const RECT& desktop, const PanelShape& shape)
 {
     if (!context || !destination)
         return;
@@ -685,27 +712,14 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
         revealProgress, 0, backdropScaleX, backdropScaleY,
         dragging ? 0.f : 1.f, 0, 0, 0}};
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    RECT windowRect{}; GetWindowRect(hwnd, &windowRect);
-    const float panelRadius=std::min({static_cast<float>(model.radius),static_cast<float>(width)*.5f,static_cast<float>(height)*.5f});
-    const float length=verticalEdge(edgeSide)?static_cast<float>(height):static_cast<float>(width);
-    const bool hasWorkArea=workAreaFirst!=0||workAreaLast!=0;
-    const float workOrigin=verticalEdge(edgeSide)?static_cast<float>(windowRect.top):static_cast<float>(windowRect.left);
-    const float workFirst=hasWorkArea?static_cast<float>(workAreaFirst)-workOrigin:0.f;
-    const float workLast=hasWorkArea?static_cast<float>(workAreaLast)-workOrigin:length;
-    const Edge shapeEdge=freeCollapsed?Edge::Center:edgeSide;
-    const float shapeAlong=freeCollapsed && freeAnchor ? static_cast<float>(freeAnchor->x)
-                                                        : freeCollapsed ? static_cast<float>(width)*.5f
-                                                                        : localAnchor(windowRect);
-    const float shapeFirst=freeCollapsed?0.f:workFirst;
-    const float shapeLast=freeCollapsed?length:workLast;
-    const PanelShape shape=panelShape(static_cast<float>(width),static_cast<float>(height),shapeEdge,
-        shapeAlong,capsuleRadius(edgeSide,model.scale,static_cast<float>(width),static_cast<float>(height)),
-        panelRadius,1.f-revealProgress,shapeFirst,shapeLast,
-        freeCollapsed && freeAnchor ? static_cast<float>(freeAnchor->y) : -1.f);
     frame.v[24]=shape.left; frame.v[25]=shape.top; frame.v[26]=shape.right; frame.v[27]=shape.bottom;
     frame.v[32]=shape.radius;
     frame.v[33]=shape.curve;
     frame.v[34]=revealProgress;
+    frame.v[40]=shape.radius;
+    frame.v[41]=shape.curve;
+    frame.v[42]=0;
+    frame.v[43]=0;
     frame.v[35]=1.f;
     if (SUCCEEDED(context->Map(frameBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         std::memcpy(mapped.pData, &frame, sizeof(frame));
@@ -770,25 +784,12 @@ void Window::Impl::draw()
         context->Begin(timingDisjoint); context->End(timingStart); queryStarted=true;
     }
     runBlur();
-    drawGlass(target, static_cast<UINT>(rc.right), static_cast<UINT>(rc.bottom), desktop);
     const float width = static_cast<float>(rc.right);
     const float height = static_cast<float>(rc.bottom);
+    const PanelShape shape = revealShape(width, height, desktop, 1.f - revealProgress);
+    drawGlass(target, static_cast<UINT>(rc.right), static_cast<UINT>(rc.bottom), desktop, shape);
 
     if (d2d) {
-        const float along=localAnchor(desktop);
-        const float length=verticalEdge(edgeSide)?height:width;
-        const float radius=capsuleRadius(edgeSide,model.scale,width,height);
-        const bool hasWorkArea=workAreaFirst!=0||workAreaLast!=0;
-        const float workOrigin=verticalEdge(edgeSide)?static_cast<float>(desktop.top):static_cast<float>(desktop.left);
-        const float workFirst=hasWorkArea?static_cast<float>(workAreaFirst)-workOrigin:0.f;
-        const float workLast=hasWorkArea?static_cast<float>(workAreaLast)-workOrigin:length;
-        const float panelRadius=std::min({static_cast<float>(model.radius),width*.5f,height*.5f});
-        const Edge shapeEdge=freeCollapsed?Edge::Center:edgeSide;
-        const float shapeAlong=freeCollapsed && freeAnchor ? static_cast<float>(freeAnchor->x)
-                                                            : freeCollapsed ? width*.5f : along;
-        const PanelShape shape=panelShape(width,height,shapeEdge,shapeAlong,radius,panelRadius,1.f-revealProgress,
-            freeCollapsed?0.f:workFirst,freeCollapsed?length:workLast,
-            freeCollapsed && freeAnchor ? static_cast<float>(freeAnchor->y) : -1.f);
         d2d->BeginDraw();
         ID2D1PathGeometry* geometry=nullptr;
         ID2D1GeometrySink* sink=nullptr;
@@ -917,7 +918,9 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
             if (impl->dragging) {
                 RECT r{}; GetWindowRect(hwnd,&r);
                 POINT cursor{}; GetCursorPos(&cursor);
-                impl->freeAnchor = Point{cursor.x - r.left, cursor.y - r.top};
+                const bool moved = cursor.x != impl->grab.x || cursor.y != impl->grab.y;
+                if (moved)
+                    impl->freeAnchor = Point{cursor.x - r.left, cursor.y - r.top};
                 impl->dragging=false; ReleaseCapture();
                 if(impl->owner->moved) impl->owner->moved({r.left,r.top}, {cursor.x,cursor.y});
                 impl->pointerOutsideSince = 0;
@@ -1169,6 +1172,10 @@ void Window::setFreeCollapsed(bool collapsed){
     m->freeCollapsed = collapsed;
     m->collapsed = collapsed;
     m->edgeSide = Edge::Center;
+    if (!collapsed && !m->freeAnchor) {
+        RECT rect{}; GetWindowRect(m->hwnd, &rect);
+        m->freeAnchor = Point{(rect.right - rect.left) / 2, (rect.bottom - rect.top) / 2};
+    }
     m->edgeAnchor.reset();
     m->pointerOutsideSince = 0;
     m->wakeOnEntry = true;
@@ -1185,11 +1192,8 @@ void Window::setCollapsed(bool collapsed){
     const bool wasFreeCollapsed = m->freeCollapsed;
     m->freeCollapsed = false;
     m->collapsed = collapsed;
-    if (wasFreeCollapsed) {
-        RECT rect{}; GetWindowRect(m->hwnd, &rect);
+    if (wasFreeCollapsed)
         m->edgeSide = Edge::Center;
-        m->edgeAnchor = (rect.left + rect.right) * .5f;
-    }
     m->pointerOutsideSince = 0;
     m->wakeOnEntry = true;
     m->updateInputStyle();
@@ -1202,24 +1206,7 @@ bool Window::hitTestCollapsedCapsule(Point point) const
     if(!m || !m->hwnd || !m->collapsed) return false;
     RECT rect{}; GetWindowRect(m->hwnd,&rect);
     const float width=static_cast<float>(rect.right-rect.left),height=static_cast<float>(rect.bottom-rect.top);
-    const float radius = capsuleRadius(m->edgeSide, m->model.scale, width, height);
-    if (m->freeCollapsed) {
-        const float diameter = std::max(2.f, std::min({radius * 2.f, width - 2.f, height - 2.f}));
-        const float centerX = rect.left + (m->freeAnchor ? m->freeAnchor->x : width * .5f);
-        const float centerY = rect.top + (m->freeAnchor ? m->freeAnchor->y : height * .5f);
-        const float dx = static_cast<float>(point.x) - centerX;
-        const float dy = static_cast<float>(point.y) - centerY;
-        return dx * dx + dy * dy <= diameter * diameter * .25f;
-    }
-    const float along=m->localAnchor(rect);
-    const Edge shapeEdge=m->edgeSide;
-    const float shapeAlong=m->freeCollapsed?(verticalEdge(m->edgeSide)?height:width)*.5f:along;
-    const bool hasWorkArea=m->workAreaFirst!=0||m->workAreaLast!=0;
-    const float workOrigin=verticalEdge(m->edgeSide)?static_cast<float>(rect.top):static_cast<float>(rect.left);
-    const PanelShape shape=panelShape(width,height,shapeEdge,shapeAlong,radius,
-        std::min({static_cast<float>(m->model.radius),width*.5f,height*.5f}),m->freeCollapsed?0.f:1.f-m->revealProgress,
-        hasWorkArea?static_cast<float>(m->workAreaFirst)-workOrigin:0.f,
-        hasWorkArea?static_cast<float>(m->workAreaLast)-workOrigin:(verticalEdge(m->edgeSide)?height:width));
+    const PanelShape shape = m->revealShape(width, height, rect, m->freeCollapsed ? 0.f : 1.f - m->revealProgress);
     const float localX=static_cast<float>(point.x-rect.left),localY=static_cast<float>(point.y-rect.top);
     if(localX<shape.left||localX>shape.right||localY<shape.top||localY>shape.bottom)return false;
     const float dx=std::max(shape.left+shape.radius-localX,0.f)+std::max(localX-(shape.right-shape.radius),0.f);
