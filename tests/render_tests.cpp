@@ -1,9 +1,12 @@
 #include <liquid_glass/window.h>
+#include "../src/edge_reveal.h"
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <d2d1_3.h>
 #include <dwmapi.h>
+#include <windows.h>
 void require(bool value,const char* message);
 int channel(const liquid_glass::Image& image,int x,int y,int c);
 LRESULT CALLBACK backgroundProc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
@@ -100,9 +103,220 @@ void desktopTest() {
 
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 int channel(const liquid_glass::Image& image,int x,int y,int c){return image.pixels[(y*image.width+x)*4+c];}
-int main(){
+void cornerAnimationProbe()
+{
+    using namespace liquid_glass;
+    constexpr int width = 300, height = 160;
+    constexpr int firstLimit = 20, lastLimit = 280;
+    Window window;
+    require(window.create(), "create corner animation window");
+    Material material;
+    material.edgeHide = true;
+    material.glass = 100;
+    material.blur = material.refraction = material.dispersion = material.rimLight = material.surfaceMotion = 0;
+    window.setMaterial(material);
+    Image backdrop{width, height, std::vector<std::uint8_t>(width * height * 4, 0)};
+    for (size_t i = 0; i < backdrop.pixels.size(); i += 4)
+        backdrop.pixels[i] = backdrop.pixels[i + 3] = 255;
+    window.setBackdrop(backdrop);
+    window.show({100, 100, width, height});
+    const auto rect = window.geometry();
+    window.paintContent = [](const ContentFrame& frame) {
+        ID2D1SolidColorBrush* brush = nullptr;
+        if (SUCCEEDED(frame.context->CreateSolidColorBrush(D2D1::ColorF(1.f, 0.f, 0.f), &brush))) {
+            frame.context->FillRectangle(D2D1::RectF(0, 0, frame.width, frame.height), brush);
+            brush->Release();
+        }
+    };
+
+    for (const auto edge : {Edge::Top, Edge::Bottom}) {
+        for (const bool left : {true, false}) {
+            material.animations = false;
+            window.setMaterial(material);
+            const int anchor = left ? firstLimit + 34 : lastLimit - 34;
+            const int first = rect.x + firstLimit, last = rect.x + lastLimit;
+            window.setEdgeCollapsed(true, edge, rect.x + anchor, first, last);
+            material.animations = true;
+            window.setMaterial(material);
+            window.setEdgeCollapsed(false, edge, {}, first, last);
+
+            int firstBlockedFrame = -1, farAtContact = 0, farthest = 0;
+            int intermediateFrames = 0, maxMismatch = 0, maxOutside = 0;
+            for (int frame = 0; frame < 75; ++frame) {
+                window.render();
+                const auto image = window.snapshot();
+                require(image.width == width && image.height == height, "corner frame readback size");
+                int firstVisible = width, lastVisible = -1, mismatch = 0;
+                for (int y = 0; y < height; ++y) {
+                    for (int x = 0; x < width; ++x) {
+                        const int alpha = channel(image, x, y, 3);
+                        const int red = channel(image, x, y, 2);
+                        if (x < firstLimit || x >= lastLimit) maxOutside = std::max(maxOutside, alpha);
+                        if (alpha < 128) continue;
+                        firstVisible = std::min(firstVisible, x);
+                        lastVisible = std::max(lastVisible, x);
+                        // Red is the content mask. Disregard pixels in its antialiasing band.
+                        mismatch += (alpha > 230 && red < 32) || (red > 230 && alpha < 250);
+                    }
+                }
+                maxMismatch = std::max(maxMismatch, mismatch);
+                const int blocked = left ? firstVisible : lastVisible;
+                const int growingSide = left ? lastVisible : width - 1 - firstVisible;
+                const int boundary = left ? firstLimit + 1 : lastLimit - 2;
+                if (std::abs(blocked - boundary) <= 1) {
+                    if (firstBlockedFrame < 0) {
+                        firstBlockedFrame = frame;
+                        farAtContact = growingSide;
+                    }
+                    farthest = std::max(farthest, growingSide);
+                    if (growingSide > farAtContact && growingSide < (left ? lastLimit - 2 : width - firstLimit - 2))
+                        ++intermediateFrames;
+                } else if (firstBlockedFrame >= 0) {
+                    require(false, "blocked side moves after contact");
+                }
+                Sleep(16);
+            }
+            std::cout << "corner " << (edge == Edge::Top ? "top-" : "bottom-") << (left ? "left" : "right")
+                      << " contactFrame=" << firstBlockedFrame << " farAdvance=" << farthest - farAtContact
+                      << " intermediateFrames=" << intermediateFrames << " outsideAlpha=" << maxOutside
+                      << " maskMismatch=" << maxMismatch << std::endl;
+            require(firstBlockedFrame >= 0 && farthest - farAtContact >= 40 && intermediateFrames >= 2,
+                    "unblocked side continues to grow across multiple frames");
+            require(maxOutside == 0, "corner glass and content stay inside work area throughout reveal");
+            require(maxMismatch <= 8, "glass and content contours agree beyond antialiasing band");
+        }
+    }
+    window.hide();
+}
+
+int main(int argc,char** argv){
     try {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        if (argc > 1 && std::string(argv[1]) == "--probe-corners") {
+            cornerAnimationProbe();
+            return 0;
+        }
+        if(argc>1 && std::string(argv[1])=="--probe-free-hide") {
+            liquid_glass::Window probe;
+            require(probe.create(),"create free-hide window");
+            liquid_glass::Material material; material.animations=true; material.edgeHide=false;
+            material.freeHideEnabled=true; material.freeHideDelayMs=500;
+            material.blur=0;material.refraction=0;material.dispersion=0;material.rimLight=0;material.surfaceMotion=0;
+            probe.setMaterial(material);
+            liquid_glass::Image backdrop;backdrop.width=240;backdrop.height=160;backdrop.pixels.resize(240*160*4,255);
+            probe.setBackdrop(backdrop);probe.show({200,180,240,160});
+            POINT cursor{};GetCursorPos(&cursor);
+            auto tick=[&]{MSG msg{};while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}probe.render();Sleep(16);};
+            SetCursorPos(1000,900);
+            const auto started=GetTickCount64();
+            while(GetTickCount64()-started<350)tick();
+            auto image=probe.snapshot();
+            require(channel(image,120,80,3)==255,"free panel remains expanded before delay");
+            Sleep(220);
+            for(int i=0;i<12;++i)tick();
+            image=probe.snapshot();
+            const auto visiblePixels=[](const liquid_glass::Image& frame){int count=0;for(int y=0;y<frame.height;++y)for(int x=0;x<frame.width;++x)count+=channel(frame,x,y,3)>0;return count;};
+            const int midpoint=visiblePixels(image);
+            require(midpoint>0&&midpoint<240*160,"free hide uses an animated intermediate shape");
+            for(int i=0;i<60;++i)tick();
+            image=probe.snapshot();
+            require(visiblePixels(image)<240*160/2,"free hide reaches its centered trigger shape");
+            SetCursorPos(320,260);
+            for(int i=0;i<15;++i)tick();
+            image=probe.snapshot();
+            const int wakeMidpoint=visiblePixels(image);
+            require(wakeMidpoint>0&&wakeMidpoint<240*160,"free wake uses an animated intermediate shape");
+            for(int i=0;i<60;++i)tick();
+            image=probe.snapshot();
+            require(channel(image,120,80,3)==255,"hovering trigger restores the full panel");
+            SetCursorPos(cursor.x,cursor.y);probe.hide();
+            std::cout<<"free_hide_window: delay, animated collapse, wake and animated reveal passed\\n";
+            return 0;
+        }
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        if(argc>1 && std::string(argv[1])=="--geometry-only") {
+            const auto centered=liquid_glass::revealSpan(160,26,80,1);
+            require(centered.first==0&&centered.last==160,"center anchor expands to both ends");
+            const auto offCenter=liquid_glass::revealSpan(160,26,45,1);
+            require(offCenter.first==0&&offCenter.last==160,"off-center anchor expands to both ends");
+            const auto hitWall=liquid_glass::revealSpan(160,26,35,1,20,160);
+            require(hitWall.first==20&&hitWall.last==160,"work-area boundary clips only the blocked side");
+            const auto asymmetric=liquid_glass::revealSpan(160,26,35,.5f,20,160);
+            require(asymmetric.first==20&&asymmetric.last>35&&asymmetric.last<160,"unblocked side continues after the other hits the work-area edge");
+            const auto collapsed=liquid_glass::revealSpan(160,26,45,0);
+            require(collapsed.first==19&&collapsed.last==71,"collapse returns to the saved pointer anchor");
+            require(liquid_glass::capsuleHit(100,100,100,100,26),"pointer anchor hits capsule");
+            require(!liquid_glass::capsuleHit(100,127,100,100,26),"pointer outside capsule does not hit");
+            const auto topCorner=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,.5f,0,300);
+            const auto topRest=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,0,0,300);
+            const auto topFull=liquid_glass::panelShape(300,180,liquid_glass::Edge::Top,26,26,20,1,0,300);
+            require(topCorner.left==1&&topCorner.right>topRest.right,"top-edge corner stops at left boundary while right side continues");
+            require(topCorner.curve>2&&topRest.curve==2&&topFull.curve==2,"liquid contour curves through the reveal and settles at both ends");
+            const auto bottomCorner=liquid_glass::panelShape(300,180,liquid_glass::Edge::Bottom,274,26,20,.5f,0,300);
+            require(bottomCorner.right==299&&bottomCorner.left>topCorner.left,"bottom-edge corner clips independently at the right boundary");
+            std::cout<<"edge_reveal_geometry: all checks passed\n";
+            return 0;
+        }
+        const auto centered=liquid_glass::revealSpan(160,26,80,1);
+        require(centered.first==0&&centered.last==160,"center anchor expands to both ends");
+        const auto offCenter=liquid_glass::revealSpan(160,26,45,1);
+        require(offCenter.first==0&&offCenter.last==160,"off-center anchor expands to both ends");
+        const auto hitWall=liquid_glass::revealSpan(160,26,35,1,20,160);
+        require(hitWall.first==20&&hitWall.last==160,"work-area boundary clips only the blocked side");
+        const auto asymmetric=liquid_glass::revealSpan(160,26,35,.5f,20,160);
+        require(asymmetric.first==20&&asymmetric.last>35&&asymmetric.last<160,"unblocked side continues after the other hits the work-area edge");
+        const auto collapsed=liquid_glass::revealSpan(160,26,45,0);
+        require(collapsed.first==19&&collapsed.last==71,"collapse returns to the saved pointer anchor");
+        if(argc>1 && std::string(argv[1])=="--probe-edge") {
+            if(argc<4) throw std::runtime_error("--probe-edge requires side and anchor");
+            const std::string side=argv[2];
+            const auto edge=side=="left"?liquid_glass::Edge::Left:side=="right"?liquid_glass::Edge::Right:side=="top"?liquid_glass::Edge::Top:liquid_glass::Edge::Bottom;
+            const int anchor=std::stoi(argv[3]);
+            const int workBoundary=argc>4?std::stoi(argv[4]):-1;
+            const bool lowerBoundary=argc>5&&std::string(argv[5])=="lower";
+            liquid_glass::Window probe;
+            if(!probe.create()) throw std::runtime_error("create edge probe window HRESULT="+std::to_string(static_cast<unsigned long>(probe.lastError())));
+            liquid_glass::Material probeMaterial; probeMaterial.animations=true; probeMaterial.blur=0; probeMaterial.refraction=0; probeMaterial.dispersion=0; probeMaterial.rimLight=0; probeMaterial.surfaceMotion=0;
+            probe.setMaterial(probeMaterial);
+            liquid_glass::Image backdrop; backdrop.width=300; backdrop.height=180; backdrop.pixels.resize(300*180*4,255);
+            for(int y=0;y<180;++y)for(int x=0;x<300;++x){const auto i=(y*300+x)*4; backdrop.pixels[i]=static_cast<unsigned char>(x%255);backdrop.pixels[i+1]=static_cast<unsigned char>(y%255);backdrop.pixels[i+2]=90;}
+            probe.setBackdrop(backdrop);probe.show({100,100,300,180});
+            const bool vertical=edge==liquid_glass::Edge::Left||edge==liquid_glass::Edge::Right;
+            const auto geometry=probe.geometry();
+            const int workFirst=workBoundary>=0&&!lowerBoundary?geometry.y+workBoundary:geometry.y;
+            const int workLast=workBoundary>=0&&lowerBoundary?geometry.y+workBoundary:geometry.y+geometry.height;
+            probe.setEdgeCollapsed(true,edge,anchor+(vertical?geometry.y:geometry.x),workFirst,workLast);
+            for(int i=0;i<100;++i){probe.render();Sleep(16);}
+            probe.render();
+            auto image=probe.snapshot();
+            const int localAnchor=anchor;
+            const int cx=vertical?(edge==liquid_glass::Edge::Left?0:299):localAnchor;
+            const int cy=vertical?localAnchor:(edge==liquid_glass::Edge::Top?0:179);
+            require(channel(image,cx,cy,3)>90,"capsule alpha at pointer anchor");
+            const int first=vertical?cy-28:cx-28, last=vertical?cy+28:cx+28;
+            const int atFirst=vertical?channel(image,edge==liquid_glass::Edge::Left?0:299,first,3):channel(image,first,edge==liquid_glass::Edge::Top?0:179,3);
+            const int atLast=vertical?channel(image,edge==liquid_glass::Edge::Left?0:299,last,3):channel(image,last,edge==liquid_glass::Edge::Top?0:179,3);
+            require(atFirst<40&&atLast<40,"capsule ends stay within pointer diameter");
+            const float anchorX=vertical?(edge==liquid_glass::Edge::Left?geometry.x:geometry.x+geometry.width):geometry.x+anchor;
+            const float anchorY=vertical?geometry.y+anchor:(edge==liquid_glass::Edge::Top?geometry.y:geometry.y+geometry.height);
+            require(probe.hitTestCollapsedCapsule({static_cast<int>(anchorX),static_cast<int>(anchorY)}),"runtime hit test accepts pointer at edge anchor");
+            const liquid_glass::Point outside=vertical?liquid_glass::Point{static_cast<int>(anchorX),static_cast<int>(anchorY)+27}:liquid_glass::Point{static_cast<int>(anchorX)+27,static_cast<int>(anchorY)};
+            require(!probe.hitTestCollapsedCapsule(outside),"runtime hit test rejects pointer outside capsule radius");
+            if(workBoundary>=0 && vertical){
+                probe.setEdgeCollapsed(false,edge,-1,workFirst,workLast);
+                for(int i=0;i<100;++i){probe.render();Sleep(16);}
+                image=probe.snapshot();probe.render();image=probe.snapshot();
+                int firstVisible=-1,lastVisible=-1,outsideAlpha=0;
+                for(int y=0;y<image.height;++y){const int a=channel(image,cx,y,3);if(a>20){if(firstVisible<0)firstVisible=y;lastVisible=y;}if((lowerBoundary?y>workBoundary:y<workBoundary)&&a>40)outsideAlpha=std::max(outsideAlpha,a);}
+                std::cout<<"probe boundary metrics side="<<side<<" anchor="<<anchor<<" interval="<<firstVisible<<".."<<lastVisible<<" outside="<<outsideAlpha<<"\\n";
+                if(lowerBoundary) require(firstVisible<anchor,"unblocked upper edge keeps expanding");
+                else require(lastVisible>anchor,"unblocked lower edge keeps expanding");
+                require(outsideAlpha==0,"expanded capsule stays inside blocked work-area edge");
+                std::cout<<"edge expansion "<<side<<" interval="<<firstVisible<<".."<<lastVisible<<" outsideAlpha="<<outsideAlpha<<"\\n";
+            }
+            std::cout<<"edge probe "<<side<<" anchor="<<anchor<<" centerAlpha="<<channel(image,cx,cy,3)<<" endAlpha="<<atFirst<<","<<atLast<<"\\n";
+            return 0;
+        }
         liquid_glass::Window window;
         require(window.create(),"create D3D11 window");
         liquid_glass::Material material;
@@ -155,6 +369,7 @@ int main(){
             const int screenEdgeX=edge==liquid_glass::Edge::Left?0:capsule.width-1;
             const int arcX=edge==liquid_glass::Edge::Left?capsule.width-1:0;
             require(channel(capsule,arcX,0,3)<10&&channel(capsule,arcX,capsule.height-1,3)<10,"side capsule arc fits short window");
+            if(channel(capsule,screenEdgeX,capsule.height/2,3)<=240) std::cerr<<"side edge alpha="<<channel(capsule,screenEdgeX,capsule.height/2,3)<<" edge="<<static_cast<int>(edge)<<" dims="<<capsule.width<<"x"<<capsule.height<<"\\n";
             require(channel(capsule,screenEdgeX,capsule.height/2,3)>240,"side capsule reaches screen edge");
             window.setEdgeCollapsed(false,edge);
         }
@@ -184,11 +399,11 @@ int main(){
         material.edgeHide=true; window.setMaterial(material);window.setClickThrough(true);
         POINT original{};GetCursorPos(&original);
         for(auto edge:{liquid_glass::Edge::Left,liquid_glass::Edge::Right,liquid_glass::Edge::Top,liquid_glass::Edge::Bottom}) {
-        window.edgeCollapsedChanged=[&,edge](bool collapsed){window.setEdgeCollapsed(collapsed,edge);};
+        window.edgeCollapsedChanged=[&,edge](bool collapsed){window.setEdgeCollapsed(collapsed,edge);return collapsed;};
         std::cout<<"click-through edge="<<static_cast<int>(edge)<<std::endl;
         window.show({80,80,240,160});window.setEdgeCollapsed(true,edge);
-        SetCursorPos(edge==liquid_glass::Edge::Left?82:edge==liquid_glass::Edge::Right?318:200,
-            edge==liquid_glass::Edge::Top?82:edge==liquid_glass::Edge::Bottom?238:160);settle(window);
+        SetCursorPos(edge==liquid_glass::Edge::Left?80:edge==liquid_glass::Edge::Right?319:200,
+            edge==liquid_glass::Edge::Top?80:edge==liquid_glass::Edge::Bottom?239:160);settle(window);
         require(!window.edgeCollapsed(),"click-through hover expands half circle");
         SetCursorPos(500,500);settle(window);settle(window);settle(window);settle(window);
         require(window.edgeCollapsed(),"click-through pointer exit collapses panel");

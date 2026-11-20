@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 struct ID2D1DeviceContext;
@@ -15,7 +16,7 @@ namespace liquid_glass {
 
 struct Point { int x = 0, y = 0; };
 struct Rect { int x = 0, y = 0, width = 0, height = 0; };
-enum class Edge { Left, Right, Top, Bottom };
+enum class Edge { Left, Right, Top, Bottom, Center };
 
 // BGRA8, top-down, tightly packed, premultiplied alpha.
 struct Image {
@@ -29,6 +30,8 @@ struct Material {
     float tileSize = 24;
     bool dark = true;
     bool edgeHide = false;
+    int freeHideDelayMs = 3000;
+    bool freeHideEnabled = false;
     bool debugPattern = false;
     bool animations = true;
     int radius = 22;
@@ -64,8 +67,12 @@ public:
     void setCaptureVisible(bool enabled);
     void setLocked(bool enabled);
     void setMaterial(Material material);
-    void setEdgeCollapsed(bool collapsed, Edge side);
+    // anchor is the screen coordinate along the edge (Y on the sides, X on top/bottom).
+    void setEdgeCollapsed(bool collapsed, Edge side, std::optional<int> anchor = {}, int workAreaFirst = 0, int workAreaLast = 0);
+    void setFreeCollapsed(bool collapsed);
+    void setCollapsed(bool collapsed);
     bool edgeCollapsed() const;
+    bool hitTestCollapsedCapsule(Point screenPoint) const;
     void render();
     Image snapshot() const;
     Image backdropSnapshot() const;
@@ -73,8 +80,8 @@ public:
     // Fixed source for deterministic GPU tests and standalone previews.
     void setBackdrop(const Image& image);
     HRESULT lastError() const;
-    std::function<void(Point)> moved;
-    std::function<void(bool)> edgeCollapsedChanged;
+    std::function<void(Point, Point)> moved;
+    std::function<bool(bool)> edgeCollapsedChanged;
     // Called inside BeginDraw/EndDraw; the caller must not retain the context.
     std::function<void(const ContentFrame&)> paintContent;
     // Optional diagnostics. GPU time is negative until a query completes.

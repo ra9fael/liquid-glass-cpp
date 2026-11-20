@@ -1,4 +1,5 @@
 #include "liquid_glass/window.h"
+#include "edge_reveal.h"
 
 #include <d2d1_3.h>
 #include <d3d11.h>
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <optional>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -42,10 +44,16 @@ template <typename T> void release(T*& value)
 
 constexpr wchar_t kClassName[] = L"LiquidGlassCppWindow";
 
+bool verticalEdge(Edge edge)
+{
+    return edge == Edge::Left || edge == Edge::Right;
+}
+
 float capsuleRadius(Edge edge, float scale, float width, float height)
 {
-    const float available = edge == Edge::Left || edge == Edge::Right ? height : width;
-    return std::min(26.0f * scale, std::max(1.0f, available * 0.5f));
+    const float along = verticalEdge(edge) ? height : width;
+    const float depth = verticalEdge(edge) ? width : height;
+    return std::min({26.0f * scale, along * 0.5f, depth});
 }
 
 const char* kGlassShader = R"(
@@ -56,8 +64,9 @@ cbuffer Frame : register(b0) {
     float4 velocityAndShape;
     float4 opticalControls;
     float4 cursorAndLighting;
-    float4 morph;
+    float4 shapeBounds;
     float4 materialStyle;
+    float4 revealSpan;
 };
 struct VOut { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
 Texture2D backdrop : register(t0);
@@ -75,8 +84,8 @@ float sdRoundRect(float2 p, float2 b, float r) {
     return min(max(q.x,q.y),0.0) + length(max(q,0.0)) - r;
 }
 float sdSquircle(float2 p, float2 halfSize, float radius, float power) {
-    float2 core = max(halfSize - radius, 1.0);
-    float2 q = max(abs(p) - core, 0.0) / max(radius, 1.0);
+    float2 core = max(halfSize - radius, 0.0);
+    float2 q = max(abs(p) - core, 0.0) / max(radius, .001);
     float implicit = pow(pow(q.x, power) + pow(q.y, power), 1.0 / power) - 1.0;
     return implicit * radius + min(max(abs(p).x - core.x, abs(p).y - core.y), 0.0);
 }
@@ -98,19 +107,15 @@ float4 PS(VOut input) : SV_TARGET {
     float surfaceMotion = opticalControls.z;
     float2 cursor = cursorAndLighting.xy;
     float cursorGlow = cursorAndLighting.z;
-    float2 p = input.uv * size - size * .5;
+    float2 localPosition = input.uv * size;
+    float2 p = localPosition - size * .5;
     float corner = min(radius, min(size.x,size.y) * .42);
     float d = sdRoundRect(p, size * .5 - 1.0, corner);
-    float capsuleRadius = morph.z;
-    float2 collapsedHalfSize = float2(capsuleRadius, capsuleRadius);
-    float2 anchor = morph.y < .5 ? float2(-size.x*.5,0)
-        : morph.y < 1.5 ? float2(size.x*.5,0)
-        : morph.y < 2.5 ? float2(0,-size.y*.5)
-        : float2(0,size.y*.5);
-    float2 center = lerp(float2(0,0), anchor, morph.x);
-    float2 halfSize = lerp(size*.5-1, collapsedHalfSize, morph.x);
-    corner = lerp(corner, capsuleRadius, morph.x);
-    d = sdRoundRect(p-center,halfSize,corner);
+        float4 bounds = shapeBounds;
+    float2 shapeCenter = (bounds.xy + bounds.zw) * .5;
+    float2 shapeHalfSize = (bounds.zw - bounds.xy) * .5;
+    d = revealSpan.y<=2.001 ? sdRoundRect(localPosition-shapeCenter, shapeHalfSize, revealSpan.x)
+        : sdSquircle(localPosition-shapeCenter, shapeHalfSize, revealSpan.x, revealSpan.y);
     float coverage = 1.0 - smoothstep(-max(fwidth(d), .75), max(fwidth(d), .75), d);
     float edge = 1.0 - smoothstep(0.0, max(3.0, corner), -d);
     float rim = pow(edge, 2.25);
@@ -242,8 +247,6 @@ struct Window::Impl {
     ULONGLONG lastMotionTick = 0;
     float velocityX = 0;
     float velocityY = 0;
-    bool collapsed = false;
-    Edge edgeSide = Edge::Right;
     bool trackingMouse = false;
     float edgePulse = 0.0f;
     float edgeVelocityX = 0.0f;
@@ -261,6 +264,23 @@ struct Window::Impl {
     bool captureVisible = true;
     bool sessionLocked = false;
     float collapseProgress = 0;
+    std::optional<float> edgeAnchor;
+    float revealProgress = 0;
+    bool collapsed = false;
+    Edge edgeSide = Edge::Right;
+    bool freeCollapsed = false;
+    bool wakeOnEntry = false;
+    int workAreaFirst = 0;
+    int workAreaLast = 0;
+
+    float localAnchor(const RECT& rect) const
+    {
+        const float screenAnchor = edgeSide==Edge::Center
+            ? ((rect.top+rect.bottom)*.5f)
+            : edgeAnchor.value_or(verticalEdge(edgeSide)?(rect.top+rect.bottom)*.5f:(rect.left+rect.right)*.5f);
+        return edgeSide==Edge::Center?((rect.bottom-rect.top)*.5f)
+            : screenAnchor-(verticalEdge(edgeSide)?rect.top:rect.left);
+    }
     float pressResponse = 0;
     bool pressed = false;
     ID3D11Query* timingDisjoint=nullptr;
@@ -331,7 +351,7 @@ bool Window::Impl::initDevice()
     if (!shaders)
         return false;
     D3D11_BUFFER_DESC buffer{};
-    buffer.ByteWidth = 128;
+    buffer.ByteWidth = 160;
     buffer.Usage = D3D11_USAGE_DYNAMIC;
     buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     buffer.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -623,8 +643,8 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     context->PSSetShader(pixelShader, nullptr, 0);
     D3D11_TEXTURE2D_DESC backdropDesc{};
     if (backdrop) backdrop->GetDesc(&backdropDesc);
-    const float desktopW = std::max(1u, backdropDesc.Width);
-    const float desktopH = std::max(1u, backdropDesc.Height);
+    const float desktopW = static_cast<float>(std::max(1u, backdropDesc.Width));
+    const float desktopH = static_cast<float>(std::max(1u, backdropDesc.Height));
     const ULONGLONG now = GetTickCount64();
     if (!dragging) {
         const float decay = std::pow(.88f, std::max<ULONGLONG>(1, now - lastMotionTick) / 16.0f);
@@ -634,7 +654,7 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
     POINT screenCursor{}; GetCursorPos(&screenCursor);
     const float localCursorX = static_cast<float>(screenCursor.x - desktop.left - width * .5f);
     const float localCursorY = static_cast<float>(screenCursor.y - desktop.top - height * .5f);
-    struct Frame { float v[32]; } frame{{
+    struct Frame { float v[36]; } frame{{
         static_cast<float>(width), static_cast<float>(height), static_cast<float>(model.radius), model.glass / 100.0f,
         static_cast<float>(model.style==1?100:model.blur), static_cast<float>(model.style==1?model.refraction*.15f:model.refraction), static_cast<float>(now % 100000) / 1000.0f, model.animations?1.0f:0.0f,
         desktopW, desktopH, static_cast<float>(desktop.left - outputDesc.DesktopCoordinates.left - backdropLeft),
@@ -642,9 +662,28 @@ void Window::Impl::drawGlass(ID3D11RenderTargetView* destination, UINT width, UI
         velocityX + edgeVelocityX, velocityY + edgeVelocityY, edgePulse, (fixedBackdrop || model.debugPattern || forceDiagnosticPattern) ? 1.0f : 0.0f,
         model.dispersion / 100.0f, model.rimLight / 100.0f, model.surfaceMotion / 100.0f, 0,
         localCursorX, localCursorY, model.animations ? model.surfaceMotion / 100.0f : 0, pressResponse,
-        collapseProgress, static_cast<float>(edgeSide), capsuleRadius(edgeSide, model.scale, static_cast<float>(width), static_cast<float>(height)), 0,
-        static_cast<float>(model.style), model.tileSize*model.scale, model.dark?1.f:0.f, 0}};
+        0, 0, 0, 0,
+        static_cast<float>(model.style), model.tileSize*model.scale, model.dark?1.f:0.f, 0,
+        0, 0, 0, 0}};
     D3D11_MAPPED_SUBRESOURCE mapped{};
+    RECT windowRect{}; GetWindowRect(hwnd, &windowRect);
+    const float panelRadius=std::min({static_cast<float>(model.radius),static_cast<float>(width)*.5f,static_cast<float>(height)*.5f});
+    const float length=verticalEdge(edgeSide)?static_cast<float>(height):static_cast<float>(width);
+    const bool hasWorkArea=workAreaFirst!=0||workAreaLast!=0;
+    const float workOrigin=verticalEdge(edgeSide)?static_cast<float>(windowRect.top):static_cast<float>(windowRect.left);
+    const float workFirst=hasWorkArea?static_cast<float>(workAreaFirst)-workOrigin:0.f;
+    const float workLast=hasWorkArea?static_cast<float>(workAreaLast)-workOrigin:length;
+    const Edge shapeEdge=freeCollapsed?Edge::Center:edgeSide;
+    const float shapeAlong=freeCollapsed?static_cast<float>(verticalEdge(edgeSide)?height:width)*.5f:localAnchor(windowRect);
+    const float shapeFirst=freeCollapsed?0.f:workFirst;
+    const float shapeLast=freeCollapsed?length:workLast;
+    const PanelShape shape=panelShape(static_cast<float>(width),static_cast<float>(height),shapeEdge,
+        shapeAlong,capsuleRadius(edgeSide,model.scale,static_cast<float>(width),static_cast<float>(height)),
+        panelRadius,1.f-revealProgress,shapeFirst,shapeLast);
+    frame.v[24]=shape.left; frame.v[25]=shape.top; frame.v[26]=shape.right; frame.v[27]=shape.bottom;
+    frame.v[32]=shape.radius;
+    frame.v[33]=shape.curve;
+    frame.v[34]=revealProgress;
     if (SUCCEEDED(context->Map(frameBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         std::memcpy(mapped.pData, &frame, sizeof(frame));
         context->Unmap(frameBuffer, 0);
@@ -690,29 +729,58 @@ void Window::Impl::draw()
     lastDrawTick=tick;
     pressResponse += ((pressed?1.f:0.f)-pressResponse)*(1-std::exp(-dt/90.f));
     const float goal=collapsed?1.f:0.f;
-    collapseProgress += (goal-collapseProgress)*(model.animations ? 1-std::exp(-dt/65.f) : 1.f);
-    if(std::abs(goal-collapseProgress)<.001f) collapseProgress=goal;
+    const float morphStep=model.animations?1-std::exp(-dt/180.f):1.f;
+    revealProgress += (goal-revealProgress)*morphStep;
+    if(std::abs(goal-revealProgress)<.001f) revealProgress=goal;
+    collapseProgress=revealProgress;
+    RECT desktop{}; GetWindowRect(hwnd, &desktop);
     captureBackdrop();
     if(measure) QueryPerformanceCounter(&captured);
     if(measure && !timingPending && timingDisjoint && timingStart && timingEnd) {
         context->Begin(timingDisjoint); context->End(timingStart); queryStarted=true;
     }
     runBlur();
-    RECT desktop{}; GetWindowRect(hwnd, &desktop);
     drawGlass(target, static_cast<UINT>(rc.right), static_cast<UINT>(rc.bottom), desktop);
     const float width = static_cast<float>(rc.right);
     const float height = static_cast<float>(rc.bottom);
 
     if (d2d) {
+        const float along=localAnchor(desktop);
+        const float length=verticalEdge(edgeSide)?height:width;
+        const float radius=capsuleRadius(edgeSide,model.scale,width,height);
+        const bool hasWorkArea=workAreaFirst!=0||workAreaLast!=0;
+        const float workOrigin=verticalEdge(edgeSide)?static_cast<float>(desktop.top):static_cast<float>(desktop.left);
+        const float workFirst=hasWorkArea?static_cast<float>(workAreaFirst)-workOrigin:0.f;
+        const float workLast=hasWorkArea?static_cast<float>(workAreaLast)-workOrigin:length;
+        const float panelRadius=std::min({static_cast<float>(model.radius),width*.5f,height*.5f});
+        const Edge shapeEdge=freeCollapsed?Edge::Center:edgeSide;
+        const float shapeAlong=freeCollapsed?(verticalEdge(edgeSide)?height:width)*.5f:along;
+        const PanelShape shape=panelShape(width,height,shapeEdge,shapeAlong,radius,panelRadius,1.f-revealProgress,
+            freeCollapsed?0.f:workFirst,freeCollapsed?length:workLast);
         d2d->BeginDraw();
-        const float contentOpacity=std::clamp(1.f-collapseProgress*5.f,0.f,1.f);
-        if (owner->paintContent && contentOpacity>0) {
-            const auto layer=D2D1::LayerParameters1(D2D1::InfiniteRect(),nullptr,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                D2D1::Matrix3x2F::Identity(),contentOpacity);
-            d2d->PushLayer(layer,nullptr);
-            owner->paintContent({d2d,width,height,backdropLuma});
+        ID2D1PathGeometry* geometry=nullptr;
+        ID2D1GeometrySink* sink=nullptr;
+        d2dFactory->CreatePathGeometry(&geometry);
+        if(geometry && SUCCEEDED(geometry->Open(&sink))){
+            const D2D1_POINT_2F tl{shape.left,shape.top},tr{shape.right,shape.top},br{shape.right,shape.bottom},bl{shape.left,shape.bottom};
+            const float r=shape.radius;
+            // Match the shader's superellipse at the diagonal of each corner.
+            const float k = (std::pow(.5f, 1.f / shape.curve) - .5f) * (8.f / 3.f);
+            sink->BeginFigure({tl.x+r,tl.y},D2D1_FIGURE_BEGIN_FILLED);
+            sink->AddLine({tr.x-r,tr.y});
+            sink->AddBezier(D2D1_BEZIER_SEGMENT{{tr.x-r+k*r,tr.y},{tr.x,tr.y+r-k*r},{tr.x,tr.y+r}});
+            sink->AddLine({br.x,br.y-r});
+            sink->AddBezier(D2D1_BEZIER_SEGMENT{{br.x,br.y-r+k*r},{br.x-r+k*r,br.y},{br.x-r,br.y}});
+            sink->AddLine({bl.x+r,bl.y});
+            sink->AddBezier(D2D1_BEZIER_SEGMENT{{bl.x+r-k*r,bl.y},{bl.x,bl.y-r+k*r},{bl.x,bl.y-r}});
+            sink->AddLine({tl.x,tl.y+r});
+            sink->AddBezier(D2D1_BEZIER_SEGMENT{{tl.x,tl.y+r-k*r},{tl.x+r-k*r,tl.y},{tl.x+r,tl.y}});
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED); sink->Close();
+            d2d->PushLayer(D2D1::LayerParameters1(D2D1::InfiniteRect(),geometry,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,D2D1::Matrix3x2F::Identity(),1.f),nullptr);
+            if(owner->paintContent) owner->paintContent({d2d,width,height,backdropLuma});
             d2d->PopLayer();
-        }
+        } else if(owner->paintContent) owner->paintContent({d2d,width,height,backdropLuma});
+        release(sink); release(geometry);
         error = d2d->EndDraw();
         if (FAILED(error)) return;
     }
@@ -777,13 +845,11 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
         if (!impl->locked) { impl->dragging = true; GetCursorPos(&impl->grab); impl->lastPointer=impl->grab; impl->lastMotionTick=GetTickCount64(); RECT r{}; GetWindowRect(hwnd, &r); impl->origin={r.left,r.top}; SetCapture(hwnd); }
         return 0;
     case WM_MOUSEMOVE:
-        KillTimer(hwnd, 41);
         if (!impl->trackingMouse) {
             TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, hwnd, 0};
             TrackMouseEvent(&tracking);
             impl->trackingMouse = true;
         }
-        if (impl->collapsed && impl->owner->edgeCollapsedChanged) impl->owner->edgeCollapsedChanged(false);
         if (impl->dragging) {
             POINT now{}; GetCursorPos(&now);
             const ULONGLONG tick=GetTickCount64(); const float dt=std::max(1.0f, static_cast<float>(tick-impl->lastMotionTick));
@@ -807,11 +873,9 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
         if (impl->dragging) {
             impl->dragging=false; ReleaseCapture();
             RECT r{}; GetWindowRect(hwnd,&r);
-            if(impl->owner->moved) impl->owner->moved({r.left,r.top});
-            GetWindowRect(hwnd,&r);
             POINT cursor{}; GetCursorPos(&cursor);
-            if (impl->model.edgeHide && impl->owner->edgeCollapsedChanged && !PtInRect(&r, cursor))
-                impl->owner->edgeCollapsedChanged(true);
+            if(impl->owner->moved) impl->owner->moved({r.left,r.top}, {cursor.x,cursor.y});
+            impl->pointerOutsideSince = 0;
         }
         return 0;
     case WM_RBUTTONUP:
@@ -821,33 +885,43 @@ LRESULT CALLBACK Window::Impl::wndProc(HWND hwnd, UINT message, WPARAM wParam, L
         return 0;
     case WM_MOUSELEAVE:
         impl->trackingMouse = false;
-        if (impl->model.edgeHide && !impl->dragging)
-            SetTimer(hwnd, 41, 700, nullptr);
         return 0;
     case WM_TIMER:
-        if(wParam==44 && IsWindowVisible(hwnd)) {
-            // Polled whenever the panel cannot hear the mouse itself: taken out
-            // of hit testing by click-through, or collapsed but still needing
-            // its capsule hovered.
-            if((impl->clickThrough || impl->collapsed) && impl->model.edgeHide && impl->owner->edgeCollapsedChanged) {
-                POINT cursor{};GetCursorPos(&cursor);RECT r{};GetWindowRect(hwnd,&r);
-                const float radius=capsuleRadius(impl->edgeSide, impl->model.scale, static_cast<float>(r.right-r.left), static_cast<float>(r.bottom-r.top));
-                const float cx=impl->edgeSide==Edge::Left?r.left:impl->edgeSide==Edge::Right?r.right:(r.left+r.right)*.5f;
-                const float cy=impl->edgeSide==Edge::Top?r.top:impl->edgeSide==Edge::Bottom?r.bottom:(r.top+r.bottom)*.5f;
-                if(impl->collapsed && (cursor.x-cx)*(cursor.x-cx)+(cursor.y-cy)*(cursor.y-cy)<=radius*radius) {
-                    impl->pointerOutsideSince=0;
-                    KillTimer(hwnd,41);
-                    impl->owner->edgeCollapsedChanged(false);
-                } else if(!impl->collapsed && !PtInRect(&r,cursor)) {
-                    if(!impl->pointerOutsideSince) impl->pointerOutsideSince=GetTickCount64();
-                    if(GetTickCount64()-impl->pointerOutsideSince>=700) impl->owner->edgeCollapsedChanged(true);
-                } else {KillTimer(hwnd,41);impl->pointerOutsideSince=0;}
+        if (wParam == 44 && IsWindowVisible(hwnd)) {
+            POINT cursor{};
+            RECT bounds{};
+            GetCursorPos(&cursor);
+            GetWindowRect(hwnd, &bounds);
+            if (impl->collapsed) {
+                if (!impl->owner->hitTestCollapsedCapsule({cursor.x, cursor.y}) && !PtInRect(&bounds, cursor)) {
+                    impl->wakeOnEntry = true;
+                } else if (impl->wakeOnEntry) {
+                    impl->wakeOnEntry = false;
+                    if (impl->freeCollapsed)
+                        impl->owner->setFreeCollapsed(false);
+                    else if (impl->owner->edgeCollapsedChanged)
+                        impl->owner->edgeCollapsedChanged(false);
+                }
+            } else if (impl->pressed || impl->dragging || PtInRect(&bounds, cursor)) {
+                impl->pointerOutsideSince = 0;
+            } else if (impl->model.edgeHide || impl->model.freeHideEnabled) {
+                const auto now = GetTickCount64();
+                if (!impl->pointerOutsideSince) impl->pointerOutsideSince = now;
+                const auto elapsed = now - impl->pointerOutsideSince;
+                const bool freeDue = impl->model.freeHideEnabled && impl->model.freeHideDelayMs > 0 &&
+                    elapsed >= static_cast<ULONGLONG>(impl->model.freeHideDelayMs);
+                const bool edgeDue = impl->model.edgeHide && elapsed >= 700;
+                const bool didEdgeCollapse = edgeDue && impl->owner->edgeCollapsedChanged &&
+                    impl->owner->edgeCollapsedChanged(true);
+                if (didEdgeCollapse) {
+                    impl->pointerOutsideSince = 0;
+                } else if (freeDue) {
+                    impl->owner->setFreeCollapsed(true);
+                    impl->pointerOutsideSince = 0;
+                }
             }
             impl->draw();
         }
-        if (wParam == 41 && !impl->clickThrough && impl->model.edgeHide && !impl->dragging && impl->owner->edgeCollapsedChanged)
-            impl->owner->edgeCollapsedChanged(true);
-        if (wParam == 41) KillTimer(hwnd, 41);
         if (wParam == 43 && impl->compositionVisual) {
             const float ease = .26f;
             impl->visualOffsetX += (impl->targetOffsetX - impl->visualOffsetX) * ease;
@@ -980,7 +1054,7 @@ void Window::destroy()
 }
 
 void Window::show(const Rect& geometry) { if(create()){setGeometry(geometry); ShowWindow(m->hwnd,SW_SHOWNOACTIVATE); SetWindowPos(m->hwnd,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE); render();} }
-void Window::hide(){ if(m->hwnd) ShowWindow(m->hwnd,SW_HIDE); }
+void Window::hide(){ m->pointerOutsideSince = 0; if(m->hwnd) ShowWindow(m->hwnd,SW_HIDE); }
 bool Window::visible() const{return m->hwnd&&IsWindowVisible(m->hwnd);}
 HWND Window::hwnd() const{return m->hwnd;}
 Rect Window::geometry() const{RECT r{};if(m->hwnd)GetWindowRect(m->hwnd,&r);return {r.left,r.top,r.right-r.left,r.bottom-r.top};}
@@ -993,14 +1067,72 @@ void Window::setCaptureVisible(bool enabled){
 void Window::setLocked(bool enabled){m->locked=enabled;}
 void Window::setMaterial(Material model){
     const bool materialChanged=m->model.style!=model.style||m->model.blur!=model.blur||m->model.glass!=model.glass||m->model.refraction!=model.refraction||m->model.radius!=model.radius||m->model.dark!=model.dark;
-    m->model=std::move(model);if(materialChanged){m->backdropDirty=true;m->blurDirty=true;}render();
+    if (m->model.edgeHide != model.edgeHide || m->model.freeHideEnabled != model.freeHideEnabled ||
+        m->model.freeHideDelayMs != model.freeHideDelayMs)
+        m->pointerOutsideSince = 0;
+    m->model=std::move(model);
+    if (!m->model.freeHideEnabled && m->freeCollapsed) setFreeCollapsed(false);
+    if (!m->model.edgeHide && m->collapsed && !m->freeCollapsed) setCollapsed(false);
+    if(materialChanged){m->backdropDirty=true;m->blurDirty=true;}render();
 }
-void Window::setEdgeCollapsed(bool collapsed,Edge side){
-    m->collapsed=collapsed;m->edgeSide=side;
+void Window::setEdgeCollapsed(bool collapsed,Edge side,std::optional<int> anchor,int workAreaFirst,int workAreaLast){
+    RECT rect{}; if(m->hwnd) GetWindowRect(m->hwnd,&rect);
+    const bool wasCollapsed=m->collapsed;
+    m->collapsed=collapsed;m->freeCollapsed=false;m->edgeSide=side;
+    m->workAreaFirst=workAreaFirst;m->workAreaLast=workAreaLast;
+    if(anchor) m->edgeAnchor=static_cast<float>(*anchor);
+    else if(!wasCollapsed&&collapsed) m->edgeAnchor=verticalEdge(side)?(rect.top+rect.bottom)*.5f:(rect.left+rect.right)*.5f;
+    m->pointerOutsideSince = 0;
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    m->wakeOnEntry = !PtInRect(&rect, cursor);
+    m->updateInputStyle();render();
+}
+void Window::setFreeCollapsed(bool collapsed){
+    if (!m->hwnd || (m->collapsed && !m->freeCollapsed) || m->freeCollapsed == collapsed) return;
+    m->freeCollapsed = collapsed;
+    m->collapsed = collapsed;
+    m->edgeSide = Edge::Center;
+    m->edgeAnchor.reset();
+    m->pointerOutsideSince = 0;
+    m->wakeOnEntry = true;
     m->updateInputStyle();
     render();
 }
+void Window::setCollapsed(bool collapsed){
+    if (!m->hwnd || m->collapsed == collapsed) return;
+    m->freeCollapsed = false;
+    m->collapsed = collapsed;
+    m->edgeSide = Edge::Center;
+    m->edgeAnchor.reset();
+    m->pointerOutsideSince = 0;
+    m->wakeOnEntry = true;
+    m->updateInputStyle();
+    render();
+}
+
 bool Window::edgeCollapsed() const{return m->collapsed;}
+bool Window::hitTestCollapsedCapsule(Point point) const
+{
+    if(!m || !m->hwnd || !m->collapsed) return false;
+    RECT rect{}; GetWindowRect(m->hwnd,&rect);
+    const float width=static_cast<float>(rect.right-rect.left),height=static_cast<float>(rect.bottom-rect.top);
+    const float radius=capsuleRadius(m->edgeSide,m->model.scale,width,height);
+    const float along=m->localAnchor(rect);
+    const Edge shapeEdge=m->freeCollapsed?Edge::Center:m->edgeSide;
+    const float shapeAlong=m->freeCollapsed?(verticalEdge(m->edgeSide)?height:width)*.5f:along;
+    const bool hasWorkArea=m->workAreaFirst!=0||m->workAreaLast!=0;
+    const float workOrigin=verticalEdge(m->edgeSide)?static_cast<float>(rect.top):static_cast<float>(rect.left);
+    const PanelShape shape=panelShape(width,height,shapeEdge,shapeAlong,radius,
+        std::min({static_cast<float>(m->model.radius),width*.5f,height*.5f}),1.f-m->revealProgress,
+        hasWorkArea?static_cast<float>(m->workAreaFirst)-workOrigin:0.f,
+        hasWorkArea?static_cast<float>(m->workAreaLast)-workOrigin:(verticalEdge(m->edgeSide)?height:width));
+    const float localX=static_cast<float>(point.x-rect.left),localY=static_cast<float>(point.y-rect.top);
+    if(localX<shape.left||localX>shape.right||localY<shape.top||localY>shape.bottom)return false;
+    const float dx=std::max(shape.left+shape.radius-localX,0.f)+std::max(localX-(shape.right-shape.radius),0.f);
+    const float dy=std::max(shape.top+shape.radius-localY,0.f)+std::max(localY-(shape.bottom-shape.radius),0.f);
+    return dx*dx+dy*dy<=shape.radius*shape.radius;
+}
 void Window::render(){if(m&&m->hwnd&&visible())m->draw();}
 Image Window::snapshot() const{return m?m->snapshot():Image();}
 Image Window::backdropSnapshot() const{return m?m->backdropSnapshot():Image();}
