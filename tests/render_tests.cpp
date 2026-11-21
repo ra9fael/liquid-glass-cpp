@@ -21,7 +21,10 @@ void settle(liquid_glass::Window& window) {
     const auto end=GetTickCount64()+350;
     while(GetTickCount64()<end) {
         MSG msg{};
-        while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}
+        // Rendering a timer message can take longer than the timer interval.
+        // Keep the pump bounded even when WM_TIMER is continuously available.
+        const auto pumpEnd=std::min(end,GetTickCount64()+16);
+        while(GetTickCount64()<pumpEnd && PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);}
         window.render();
         Sleep(20);
     }
@@ -197,6 +200,7 @@ void cornerAnimationProbe()
 }
 
 int main(int argc,char** argv){
+    std::cout << std::unitbuf;
     try {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         if (argc > 1 && std::string(argv[1]) == "--probe-corners") {
@@ -412,6 +416,7 @@ int main(int argc,char** argv){
             std::cout<<"edge probe "<<side<<" anchor="<<anchor<<" centerAlpha="<<channel(image,cx,cy,3)<<" endAlpha="<<atFirst<<","<<atLast<<"\\n";
             return 0;
         }
+        std::cout << "render: fixed-backdrop resize and blur" << std::endl;
         liquid_glass::Window window;
         require(window.create(),"create D3D11 window");
         liquid_glass::Material material;
@@ -490,12 +495,14 @@ int main(int argc,char** argv){
             require(channel(window.snapshot(),120,80,3)==255,"expanded panel restores glass");
         }
         window.hide();
+        std::cout << "render: interactive desktop capture and resize" << std::endl;
         desktopTest();
         material.edgeHide=true; window.setMaterial(material);window.setClickThrough(true);
         POINT original{};GetCursorPos(&original);
         for(auto edge:{liquid_glass::Edge::Left,liquid_glass::Edge::Right,liquid_glass::Edge::Top,liquid_glass::Edge::Bottom}) {
         window.edgeCollapsedChanged=[&,edge](bool collapsed){window.setEdgeCollapsed(collapsed,edge);return true;};
         std::cout<<"click-through edge="<<static_cast<int>(edge)<<std::endl;
+        SetCursorPos(500,500);
         window.show({80,80,240,160});window.setEdgeCollapsed(true,edge);
         SetCursorPos(edge==liquid_glass::Edge::Left?80:edge==liquid_glass::Edge::Right?319:200,
             edge==liquid_glass::Edge::Top?80:edge==liquid_glass::Edge::Bottom?239:160);settle(window);
